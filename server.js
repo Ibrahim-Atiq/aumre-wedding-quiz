@@ -7,31 +7,14 @@
  * Designed for free-tier Render deployment (single port, zero database,
  * 20s WebSocket heartbeat, resilient mobile reconnects).
  *
- * ----------------------------------------------------------------------------
- * PACKAGE.JSON BLUEPRINT:
- * ----------------------------------------------------------------------------
- * {
- *   "name": "aumre-joudy-wedding-quiz",
- *   "version": "1.0.0",
- *   "description": "Multiplayer Wedding Quiz for Aumre & Joudy",
- *   "main": "server.js",
- *   "scripts": {
- *     "start": "node server.js"
- *   },
- *   "dependencies": {
- *     "express": "^4.21.2",
- *     "ws": "^8.18.0"
- *   }
- * }
- * ----------------------------------------------------------------------------
- * 
- * QUICK START:
- * 1. npm install express ws
- * 2. node server.js
- * 3. Open http://localhost:3000/host for Host/MC Screen (Projector/TV)
- * 4. Open http://localhost:3000/ for Mobile Guests
- *
- * HOST PIN: 1234 (can be changed via HOST_PIN env var or in code below)
+ * Wedding Stationery Theme inspired by Aumre & Joudy's Seating Plan & Program:
+ * - Luxury warm ivory / cream linen palette (#fbf8f2)
+ * - Deep forest pine / botanical slate typography (#182f28)
+ * - Warm gold foil accents (#b88d43, #c59b4e)
+ * - Fine double hairline framing and diamond ornaments (◆)
+ * - Automated game progression with host pause/resume controls
+ * - Flexible host navigation (never get stuck between Question, Reveal & Leaderboard)
+ * - Guest manager (live lobby list with kick capability)
  * ============================================================================
  */
 
@@ -43,7 +26,11 @@ const crypto = require('crypto');
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
 const HOST_PIN = process.env.HOST_PIN || "1234";
+
+// Timing settings (seconds)
 const QUESTION_TIMER_SECONDS = 20;
+const REVEAL_TIMER_SECONDS = 8;
+const LEADERBOARD_TIMER_SECONDS = 7;
 const HEARTBEAT_INTERVAL = 20000; // 20s Render WS keepalive ping
 
 // --- 20 OFFICIAL QUESTIONS & ANSWER KEY (COUPLE: AUMRE & JOUDY) ---
@@ -78,55 +65,68 @@ let gameState = {
   status: 'LOBBY', // 'LOBBY' | 'QUESTION' | 'REVEAL' | 'LEADERBOARD' | 'FINAL'
   questionIndex: 0,
   timeRemaining: QUESTION_TIMER_SECONDS,
-  isTimerRunning: false,
+  maxTime: QUESTION_TIMER_SECONDS,
+  isPaused: false,
+  autoFlow: true, // Auto progression enabled by default
   questionStartTime: null,
   answers: {} // playerId -> { answer: 'Aumre' | 'Joudy', timestamp: number, pointsEarned: number }
 };
 
 let timerInterval = null;
 
-// --- TIMER CONTROLLER ---
-function startTimer() {
-  stopTimer();
-  gameState.isTimerRunning = true;
-  gameState.questionStartTime = Date.now();
-  gameState.timeRemaining = QUESTION_TIMER_SECONDS;
+// --- TIMER & AUTOMATIC FLOW ENGINE ---
+function stopTimer() {
+  if (timerInterval) {
+    clearInterval(timerInterval);
+    timerInterval = null;
+  }
+}
 
-  broadcastGameState();
+function startPhaseTimer(seconds, onExpire) {
+  stopTimer();
+  gameState.timeRemaining = seconds;
+  gameState.maxTime = seconds;
+  broadcastTimerTick();
 
   timerInterval = setInterval(() => {
+    if (gameState.isPaused) return; // Do not decrement while paused
+
     gameState.timeRemaining -= 1;
     if (gameState.timeRemaining <= 0) {
       stopTimer();
       gameState.timeRemaining = 0;
-      handleTimerExpired();
+      broadcastTimerTick();
+      if (gameState.autoFlow && onExpire) {
+        onExpire();
+      }
     } else {
       broadcastTimerTick();
     }
   }, 1000);
 }
 
-function stopTimer() {
-  if (timerInterval) {
-    clearInterval(timerInterval);
-    timerInterval = null;
-  }
-  gameState.isTimerRunning = false;
+function launchQuestion(qIndex) {
+  stopTimer();
+  gameState.status = 'QUESTION';
+  gameState.questionIndex = qIndex;
+  gameState.answers = {};
+  gameState.questionStartTime = Date.now();
+
+  broadcastGameState();
+
+  // 20s question timer -> auto transitions to REVEAL
+  startPhaseTimer(QUESTION_TIMER_SECONDS, () => {
+    launchReveal();
+  });
 }
 
-function handleTimerExpired() {
-  revealCurrentQuestion();
-}
-
-// --- SCORING & REVEAL LOGIC ---
-function revealCurrentQuestion() {
+function launchReveal() {
   stopTimer();
   gameState.status = 'REVEAL';
 
   const currentQ = QUESTIONS[gameState.questionIndex];
   const correct = currentQ.correctAnswer;
 
-  // Calculate vote counts
   let aumreVotes = 0;
   let joudyVotes = 0;
 
@@ -140,7 +140,6 @@ function revealCurrentQuestion() {
   const aumrePct = totalVotes > 0 ? Math.round((aumreVotes / totalVotes) * 100) : 50;
   const joudyPct = totalVotes > 0 ? (100 - aumrePct) : 50;
 
-  // Send personalized results to players and general results to host
   broadcastReveal({
     questionIndex: gameState.questionIndex,
     correctAnswer: correct,
@@ -150,8 +149,35 @@ function revealCurrentQuestion() {
     joudyPct,
     totalVotes
   });
+
+  // 8s reveal timer -> auto transitions to LEADERBOARD
+  startPhaseTimer(REVEAL_TIMER_SECONDS, () => {
+    launchLeaderboard();
+  });
 }
 
+function launchLeaderboard() {
+  stopTimer();
+  gameState.status = 'LEADERBOARD';
+  broadcastGameState();
+
+  // 7s leaderboard timer -> auto transitions to NEXT QUESTION or FINAL
+  startPhaseTimer(LEADERBOARD_TIMER_SECONDS, () => {
+    if (gameState.questionIndex + 1 < QUESTIONS.length) {
+      launchQuestion(gameState.questionIndex + 1);
+    } else {
+      launchFinal();
+    }
+  });
+}
+
+function launchFinal() {
+  stopTimer();
+  gameState.status = 'FINAL';
+  broadcastGameState();
+}
+
+// --- LEADERBOARD & STATS HELPERS ---
 function getLeaderboard(limit = 10) {
   const list = Array.from(players.values())
     .map(p => ({
@@ -169,30 +195,14 @@ function getLeaderboard(limit = 10) {
   };
 }
 
-// --- BROADCAST HELPERS ---
-function broadcastToAll(messageObj) {
-  const payload = JSON.stringify(messageObj);
-  // Send to host
-  hostSockets.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
-  });
-  // Send to players
-  players.forEach(p => {
-    if (p.ws && p.ws.readyState === WebSocket.OPEN) p.ws.send(payload);
-  });
-}
-
-function broadcastTimerTick() {
-  const payload = JSON.stringify({
-    type: 'TIMER_TICK',
-    timeRemaining: gameState.timeRemaining
-  });
-  hostSockets.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
-  });
-  players.forEach(p => {
-    if (p.ws && p.ws.readyState === WebSocket.OPEN) p.ws.send(payload);
-  });
+function getGuestList() {
+  return Array.from(players.values()).map(p => ({
+    id: p.id,
+    nickname: p.nickname,
+    score: p.score || 0,
+    connected: p.connected,
+    hasAnswered: !!gameState.answers[p.id]
+  })).sort((a, b) => a.nickname.localeCompare(b.nickname));
 }
 
 function getHostStatePayload() {
@@ -200,6 +210,7 @@ function getHostStatePayload() {
   const answeredCount = Object.keys(gameState.answers).length;
   const totalActivePlayers = Array.from(players.values()).filter(p => p.connected).length;
   const leaderboard = getLeaderboard(10);
+  const guestList = getGuestList();
 
   let aumreVotes = 0;
   let joudyVotes = 0;
@@ -216,11 +227,14 @@ function getHostStatePayload() {
     totalQuestions: QUESTIONS.length,
     currentQuestion: currentQ,
     timeRemaining: gameState.timeRemaining,
-    isTimerRunning: gameState.isTimerRunning,
+    maxTime: gameState.maxTime,
+    isPaused: gameState.isPaused,
+    autoFlow: gameState.autoFlow,
     answeredCount,
     totalActivePlayers,
     totalRegisteredPlayers: players.size,
     leaderboard: leaderboard.top,
+    guestList,
     votingStats: {
       aumreVotes,
       joudyVotes,
@@ -231,14 +245,28 @@ function getHostStatePayload() {
   };
 }
 
+function broadcastTimerTick() {
+  const payload = JSON.stringify({
+    type: 'TIMER_TICK',
+    status: gameState.status,
+    timeRemaining: gameState.timeRemaining,
+    maxTime: gameState.maxTime,
+    isPaused: gameState.isPaused
+  });
+  hostSockets.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+  });
+  players.forEach(p => {
+    if (p.ws && p.ws.readyState === WebSocket.OPEN) p.ws.send(payload);
+  });
+}
+
 function broadcastGameState() {
-  // Update Host
   const hostPayload = JSON.stringify(getHostStatePayload());
   hostSockets.forEach(ws => {
     if (ws.readyState === WebSocket.OPEN) ws.send(hostPayload);
   });
 
-  // Update Players
   const currentQ = QUESTIONS[gameState.questionIndex];
   const leaderboard = getLeaderboard(players.size);
 
@@ -254,6 +282,8 @@ function broadcastGameState() {
         totalQuestions: QUESTIONS.length,
         question: currentQ ? currentQ.question : '',
         timeRemaining: gameState.timeRemaining,
+        maxTime: gameState.maxTime,
+        isPaused: gameState.isPaused,
         score: p.score,
         myAnswer,
         rank: myRank || 1,
@@ -304,19 +334,16 @@ function broadcastReveal(stats) {
 const app = express();
 app.use(express.json());
 
-// 1. HOST ROUTE: /host
 app.get('/host', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(HOST_HTML);
 });
 
-// 2. PLAYER ROUTE: /
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(PLAYER_HTML);
 });
 
-// Health check for Render
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', players: players.size });
 });
@@ -325,19 +352,18 @@ app.get('/health', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// WebSocket Connection Handler
-wss.on('connection', (ws, req) => {
+wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  let clientType = 'UNKNOWN'; // 'HOST' | 'PLAYER'
+  let clientType = 'UNKNOWN';
   let attachedPlayerId = null;
 
   ws.on('message', (messageRaw) => {
     try {
       const msg = JSON.parse(messageRaw);
 
-      // --- HOST MESSAGES ---
+      // --- HOST AUTH & ACTIONS ---
       if (msg.type === 'HOST_AUTH') {
         if (msg.pin === HOST_PIN) {
           clientType = 'HOST';
@@ -355,12 +381,11 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      // --- PLAYER MESSAGES ---
+      // --- PLAYER JOIN & ACTIONS ---
       if (msg.type === 'PLAYER_JOIN') {
         const nickname = (msg.nickname || '').trim().slice(0, 18) || 'Guest';
         let pId = msg.playerId;
 
-        // Reconnect existing or register new
         if (pId && players.has(pId)) {
           const existing = players.get(pId);
           existing.ws = ws;
@@ -418,7 +443,7 @@ wss.on('connection', (ws, req) => {
 
       if (msg.type === 'SUBMIT_ANSWER' && attachedPlayerId) {
         if (gameState.status !== 'QUESTION') return;
-        if (gameState.answers[attachedPlayerId]) return; // already answered this question
+        if (gameState.answers[attachedPlayerId]) return;
 
         const chosen = msg.answer;
         if (chosen !== 'Aumre' && chosen !== 'Joudy') return;
@@ -426,7 +451,6 @@ wss.on('connection', (ws, req) => {
         const currentQ = QUESTIONS[gameState.questionIndex];
         const isCorrect = chosen === currentQ.correctAnswer;
 
-        // Speed scoring: 500 base points + up to 500 speed bonus
         let points = 0;
         if (isCorrect) {
           const elapsedSec = (Date.now() - (gameState.questionStartTime || Date.now())) / 1000;
@@ -435,9 +459,7 @@ wss.on('connection', (ws, req) => {
         }
 
         const p = players.get(attachedPlayerId);
-        if (p) {
-          p.score = (p.score || 0) + points;
-        }
+        if (p) p.score = (p.score || 0) + points;
 
         gameState.answers[attachedPlayerId] = {
           answer: chosen,
@@ -445,29 +467,23 @@ wss.on('connection', (ws, req) => {
           pointsEarned: points
         };
 
-        // Confirm to player immediately
         ws.send(JSON.stringify({
           type: 'ANSWER_ACCEPTED',
           answer: chosen,
           questionIndex: gameState.questionIndex
         }));
 
-        // Notify host about answered count update
+        // Send updated state to host
         const hostPayload = JSON.stringify(getHostStatePayload());
         hostSockets.forEach(h => {
           if (h.readyState === WebSocket.OPEN) h.send(hostPayload);
         });
 
-        // If everyone answered, notify host
+        // If all online players answered early during QUESTION, auto-reveal!
         const activeCount = Array.from(players.values()).filter(pl => pl.connected).length;
         const ansCount = Object.keys(gameState.answers).length;
-        if (activeCount > 0 && ansCount >= activeCount) {
-          // All active players answered
-          hostSockets.forEach(h => {
-            if (h.readyState === WebSocket.OPEN) {
-              h.send(JSON.stringify({ type: 'ALL_ANSWERED' }));
-            }
-          });
+        if (activeCount > 0 && ansCount >= activeCount && gameState.autoFlow && !gameState.isPaused) {
+          launchReveal();
         }
       }
 
@@ -483,7 +499,6 @@ wss.on('connection', (ws, req) => {
       const p = players.get(attachedPlayerId);
       p.connected = false;
       p.ws = null;
-      // Update host screen active player count
       const hostPayload = JSON.stringify(getHostStatePayload());
       hostSockets.forEach(h => {
         if (h.readyState === WebSocket.OPEN) h.send(hostPayload);
@@ -496,50 +511,46 @@ wss.on('connection', (ws, req) => {
 function handleHostAction(msg) {
   switch (msg.action) {
     case 'START_GAME':
-      gameState.status = 'QUESTION';
-      gameState.questionIndex = 0;
-      gameState.answers = {};
-      startTimer();
+      gameState.isPaused = false;
+      launchQuestion(0);
       break;
 
     case 'REVEAL_NOW':
-      if (gameState.status === 'QUESTION') {
-        revealCurrentQuestion();
-      }
+      // Move immediately to reveal
+      launchReveal();
+      break;
+
+    case 'BACK_TO_QUESTION':
+      // Return to question view without re-running full timer
+      gameState.status = 'QUESTION';
+      broadcastGameState();
       break;
 
     case 'SHOW_LEADERBOARD':
-      stopTimer();
-      gameState.status = 'LEADERBOARD';
-      broadcastGameState();
+      launchLeaderboard();
       break;
 
     case 'NEXT_QUESTION':
       if (gameState.questionIndex + 1 < QUESTIONS.length) {
-        gameState.questionIndex += 1;
-        gameState.answers = {};
-        gameState.status = 'QUESTION';
-        startTimer();
+        launchQuestion(gameState.questionIndex + 1);
       } else {
-        stopTimer();
-        gameState.status = 'FINAL';
-        broadcastGameState();
+        launchFinal();
       }
       break;
 
     case 'PREV_QUESTION':
       if (gameState.questionIndex > 0) {
-        gameState.questionIndex -= 1;
-        gameState.answers = {};
-        gameState.status = 'QUESTION';
-        startTimer();
+        launchQuestion(gameState.questionIndex - 1);
       }
       break;
 
-    case 'SHOW_FINAL':
-      stopTimer();
-      gameState.status = 'FINAL';
-      broadcastGameState();
+    case 'TOGGLE_PAUSE':
+      gameState.isPaused = !gameState.isPaused;
+      broadcastTimerTick();
+      const hostPayload = JSON.stringify(getHostStatePayload());
+      hostSockets.forEach(h => {
+        if (h.readyState === WebSocket.OPEN) h.send(hostPayload);
+      });
       break;
 
     case 'RESET_GAME':
@@ -547,28 +558,25 @@ function handleHostAction(msg) {
       gameState.status = 'LOBBY';
       gameState.questionIndex = 0;
       gameState.answers = {};
+      gameState.isPaused = false;
       players.forEach(p => { p.score = 0; });
       broadcastGameState();
       break;
 
-    case 'PAUSE_RESUME_TIMER':
-      if (gameState.isTimerRunning) {
-        stopTimer();
-      } else if (gameState.status === 'QUESTION' && gameState.timeRemaining > 0) {
-        gameState.isTimerRunning = true;
-        gameState.questionStartTime = Date.now() - ((QUESTION_TIMER_SECONDS - gameState.timeRemaining) * 1000);
-        timerInterval = setInterval(() => {
-          gameState.timeRemaining -= 1;
-          if (gameState.timeRemaining <= 0) {
-            stopTimer();
-            gameState.timeRemaining = 0;
-            handleTimerExpired();
-          } else {
-            broadcastTimerTick();
-          }
-        }, 1000);
+    case 'KICK_PLAYER':
+      const targetId = msg.playerId;
+      if (targetId && players.has(targetId)) {
+        const target = players.get(targetId);
+        if (target.ws && target.ws.readyState === WebSocket.OPEN) {
+          try {
+            target.ws.send(JSON.stringify({ type: 'KICKED', reason: 'Removed by host' }));
+            target.ws.close();
+          } catch(e) {}
+        }
+        delete gameState.answers[targetId];
+        players.delete(targetId);
+        broadcastGameState();
       }
-      broadcastGameState();
       break;
   }
 }
@@ -576,17 +584,13 @@ function handleHostAction(msg) {
 // --- RENDER FREE-TIER WEBSOCKET KEEPALIVE HEARTBEAT ---
 const heartbeat = setInterval(() => {
   wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) {
-      return ws.terminate();
-    }
+    if (ws.isAlive === false) return ws.terminate();
     ws.isAlive = false;
     ws.ping();
   });
 }, HEARTBEAT_INTERVAL);
 
-wss.on('close', () => {
-  clearInterval(heartbeat);
-});
+wss.on('close', () => { clearInterval(heartbeat); });
 
 // Start Server
 server.listen(PORT, () => {
@@ -602,6 +606,7 @@ server.listen(PORT, () => {
 
 // ============================================================================
 // FRONTEND: HOST / MC DISPLAY TEMPLATE (/host)
+// Wedding Stationery Theme (Ivory Linen, Double Gold Hairlines, Pine Typography)
 // ============================================================================
 const HOST_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -611,720 +616,739 @@ const HOST_HTML = `<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,700;1,600&family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500;1,600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <style>
     :root {
-      --bg-dark: #0a0d14;
-      --card-bg: rgba(18, 24, 38, 0.85);
-      --gold: #d4af37;
-      --gold-light: #f7e7b4;
-      --groom-blue: #2563eb;
-      --groom-dark: #1e3a8a;
-      --bride-rose: #f43f5e;
-      --bride-dark: #9f1239;
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
+      --bg-linen: #fbf8f2;
+      --bg-card: #ffffff;
+      --pine: #182f28;
+      --pine-light: #2c493f;
+      --text-muted: #5e6f66;
+      --gold: #b88d43;
+      --gold-light: #d8b773;
+      --gold-subtle: #eedebc;
+      --gold-border: rgba(184, 141, 67, 0.45);
+      --groom-green: #17332c;
+      --bride-rose: #7d2a3e;
+      --shadow-stationery: 0 10px 35px rgba(24, 47, 40, 0.08);
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      background: radial-gradient(circle at 50% 20%, #171f33 0%, #080b11 100%);
-      color: var(--text);
+      background: var(--bg-linen);
+      color: var(--pine);
       font-family: 'Plus Jakarta Sans', sans-serif;
       min-height: 100vh;
-      overflow-x: hidden;
       display: flex;
       flex-direction: column;
-    }
-
-    /* Ambient Wedding Lights */
-    .ambient-glow {
-      position: fixed;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: 
-        radial-gradient(circle at 15% 15%, rgba(212, 175, 55, 0.08) 0%, transparent 40%),
-        radial-gradient(circle at 85% 85%, rgba(244, 63, 94, 0.06) 0%, transparent 40%),
-        radial-gradient(circle at 80% 20%, rgba(37, 99, 235, 0.08) 0%, transparent 40%);
-      pointer-events: none;
-      z-index: 0;
-    }
-
-    header {
       position: relative;
-      z-index: 10;
+    }
+
+    /* Subtle luxury wedding stationery framing around entire screen */
+    .stationery-frame {
+      position: fixed;
+      top: 10px; bottom: 10px; left: 10px; right: 10px;
+      border: 1px solid var(--gold-border);
+      outline: 1px solid rgba(184, 141, 67, 0.2);
+      outline-offset: -5px;
+      pointer-events: none;
+      z-index: 100;
+    }
+
+    /* HEADER */
+    header {
+      padding: 1.2rem 3rem;
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 1.2rem 2.5rem;
-      border-bottom: 1px solid rgba(212, 175, 55, 0.2);
-      backdrop-filter: blur(12px);
-      background: rgba(10, 13, 20, 0.6);
+      border-bottom: 1px solid var(--gold-subtle);
+      background: rgba(251, 248, 242, 0.95);
+      backdrop-filter: blur(8px);
+      z-index: 10;
     }
-    .brand {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 2.2rem;
-      font-weight: 700;
-      letter-spacing: 1px;
-      color: var(--gold-light);
+    .header-branding {
       display: flex;
-      align-items: center;
-      gap: 0.6rem;
+      flex-direction: column;
     }
-    .brand span { color: var(--gold); }
-    .header-stats {
-      display: flex;
-      align-items: center;
-      gap: 1.5rem;
+    .header-super {
+      font-family: 'Cinzel', serif;
+      font-size: 0.72rem;
+      letter-spacing: 3px;
+      color: var(--gold);
+      text-transform: uppercase;
     }
-    .stat-pill {
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      padding: 0.5rem 1.2rem;
-      border-radius: 999px;
-      font-size: 0.95rem;
+    .header-title {
+      font-family: 'Playfair Display', serif;
+      font-size: 1.9rem;
       font-weight: 600;
+      color: var(--pine);
+      font-style: italic;
+    }
+    .header-title span {
+      font-style: normal;
+      color: var(--gold);
+      font-family: 'Cinzel', serif;
+      font-size: 1.4rem;
+      margin: 0 0.3rem;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    .pill-btn {
+      background: #fff;
+      border: 1px solid var(--gold-border);
+      color: var(--pine);
+      padding: 0.5rem 1.1rem;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      cursor: pointer;
       display: flex;
       align-items: center;
       gap: 0.5rem;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.03);
+      transition: all 0.2s;
     }
-    .stat-pill .dot {
-      width: 10px; height: 10px;
+    .pill-btn:hover {
+      border-color: var(--gold);
+      background: #faf6ee;
+    }
+    .dot-live {
+      width: 8px; height: 8px;
       border-radius: 50%;
       background: #10b981;
-      box-shadow: 0 0 10px #10b981;
     }
 
+    /* AUTO PROGRESS BAR */
+    .flow-indicator {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.4rem 3rem;
+      background: #f4ecdc;
+      font-size: 0.82rem;
+      color: var(--pine);
+      font-weight: 600;
+      border-bottom: 1px solid var(--gold-subtle);
+    }
+    .flow-bar {
+      flex: 1;
+      height: 4px;
+      background: rgba(184, 141, 67, 0.2);
+      margin: 0 1.5rem;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .flow-bar-inner {
+      height: 100%;
+      background: var(--gold);
+      width: 100%;
+      transition: width 1s linear;
+    }
+
+    /* MAIN CONTAINER */
     main {
       flex: 1;
       display: flex;
       flex-direction: column;
-      position: relative;
-      z-index: 10;
-      padding: 2rem 3rem;
-      max-width: 1400px;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem 3.5rem;
+      max-width: 1300px;
       margin: 0 auto;
       width: 100%;
+      z-index: 10;
     }
 
-    /* Views */
-    .view { display: none; width: 100%; height: 100%; animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
+    .view { display: none; width: 100%; }
     .view.active { display: flex; flex-direction: column; align-items: center; justify-content: center; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
-    /* LOBBY VIEW */
-    .lobby-container {
-      display: grid;
-      grid-template-columns: 1fr 1.1fr;
-      gap: 3.5rem;
-      align-items: center;
-      background: var(--card-bg);
-      border: 1px solid rgba(212, 175, 55, 0.3);
-      border-radius: 28px;
+    /* CARD STYLING (MATCHES INVITATION & SEATING PLAN) */
+    .stationery-card {
+      background: var(--bg-card);
+      border: 1px solid var(--gold-border);
+      box-shadow: inset 0 0 0 3px #fbf8f2, inset 0 0 0 4px var(--gold-border), var(--shadow-stationery);
+      border-radius: 4px;
       padding: 3.5rem;
-      box-shadow: 0 25px 60px rgba(0,0,0,0.5), 0 0 30px rgba(212, 175, 55, 0.1);
       width: 100%;
-    }
-    .qr-card {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      text-align: center;
-      background: white;
-      padding: 2rem;
-      border-radius: 20px;
-      color: #0f172a;
-    }
-    #qrcode {
-      margin-bottom: 1.2rem;
-      padding: 10px;
-      border-radius: 12px;
-      background: white;
-    }
-    #qrcode img { display: block; }
-    .qr-card p {
-      font-size: 1.15rem;
-      font-weight: 700;
-      color: #1e293b;
-    }
-    .qr-card .url-pill {
-      font-size: 0.95rem;
-      color: #64748b;
-      margin-top: 0.3rem;
-      font-family: monospace;
-      word-break: break-all;
-    }
-    .lobby-info {
-      display: flex;
-      flex-direction: column;
-      gap: 1.5rem;
-    }
-    .lobby-title {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 3.6rem;
-      line-height: 1.1;
-      color: var(--gold-light);
-    }
-    .lobby-subtitle {
-      font-size: 1.25rem;
-      color: var(--text-muted);
-      line-height: 1.5;
-    }
-    .guest-counter {
-      display: flex;
-      align-items: baseline;
-      gap: 0.8rem;
-    }
-    .guest-counter .num {
-      font-size: 4rem;
-      font-weight: 800;
-      color: var(--gold);
-    }
-    .guest-counter .label {
-      font-size: 1.2rem;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 1px;
-    }
-    .btn-start {
-      background: linear-gradient(135deg, #d4af37 0%, #aa8010 100%);
-      color: #0b0f19;
-      border: none;
-      padding: 1.2rem 2.8rem;
-      border-radius: 16px;
-      font-size: 1.35rem;
-      font-weight: 800;
-      letter-spacing: 0.5px;
-      cursor: pointer;
-      transition: all 0.25s ease;
-      box-shadow: 0 10px 30px rgba(212, 175, 55, 0.35);
-      align-self: flex-start;
-    }
-    .btn-start:hover {
-      transform: translateY(-2px) scale(1.02);
-      box-shadow: 0 14px 40px rgba(212, 175, 55, 0.5);
-    }
-
-    /* QUESTION VIEW */
-    .question-screen {
-      width: 100%;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 2rem;
-    }
-    .q-top-bar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      width: 100%;
-    }
-    .q-counter-badge {
-      font-size: 1.2rem;
-      color: var(--gold);
-      font-weight: 700;
-      letter-spacing: 1px;
-      text-transform: uppercase;
-    }
-    .timer-circle {
       position: relative;
-      width: 100px;
-      height: 100px;
-    }
-    .timer-circle svg {
-      transform: rotate(-90deg);
-      width: 100px;
-      height: 100px;
-    }
-    .timer-circle circle {
-      fill: none;
-      stroke-width: 8;
-    }
-    .timer-bg { stroke: rgba(255, 255, 255, 0.1); }
-    .timer-progress {
-      stroke: var(--gold);
-      stroke-linecap: round;
-      stroke-dasharray: 264;
-      stroke-dashoffset: 0;
-      transition: stroke-dashoffset 1s linear, stroke 0.3s ease;
-    }
-    .timer-text {
-      position: absolute;
-      top: 50%; left: 50%;
-      transform: translate(-50%, -50%);
-      font-size: 2.2rem;
-      font-weight: 800;
-      color: #fff;
-    }
-    .question-box {
-      background: var(--card-bg);
-      border: 1px solid rgba(212, 175, 55, 0.4);
-      border-radius: 24px;
-      padding: 3rem 4rem;
-      text-align: center;
-      box-shadow: 0 20px 50px rgba(0,0,0,0.6);
-      width: 100%;
-      max-width: 1100px;
-    }
-    .question-box h2 {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 3.4rem;
-      line-height: 1.2;
-      color: #ffffff;
-      margin-bottom: 0.5rem;
-    }
-    .live-progress-bar-container {
-      width: 100%;
-      max-width: 800px;
-      margin-top: 1.5rem;
-      display: flex;
-      flex-direction: column;
-      gap: 0.6rem;
-    }
-    .bar-labels {
-      display: flex;
-      justify-content: space-between;
-      font-size: 1.15rem;
-      font-weight: 700;
-      color: var(--text-muted);
-    }
-    .bar-track {
-      background: rgba(255, 255, 255, 0.1);
-      height: 16px;
-      border-radius: 999px;
-      overflow: hidden;
-    }
-    .bar-fill {
-      background: linear-gradient(90deg, #10b981 0%, #34d399 100%);
-      height: 100%;
-      width: 0%;
-      transition: width 0.3s ease;
-      border-radius: 999px;
     }
 
-    /* REVEAL SCREEN */
-    .reveal-card {
-      width: 100%;
-      max-width: 1100px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 2.5rem;
-    }
-    .winner-announcement {
+    .card-ornament {
       text-align: center;
-    }
-    .winner-announcement .badge {
-      display: inline-block;
-      padding: 0.4rem 1.4rem;
-      background: rgba(212, 175, 55, 0.2);
-      border: 1px solid var(--gold);
-      color: var(--gold-light);
-      border-radius: 999px;
-      font-size: 1.1rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 1px;
+      color: var(--gold);
+      font-size: 0.9rem;
+      letter-spacing: 5px;
       margin-bottom: 0.8rem;
     }
-    .winner-announcement h1 {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 4.2rem;
-      color: #fff;
+
+    /* 1. LOBBY VIEW */
+    .lobby-layout {
+      display: grid;
+      grid-template-columns: 1fr 1.3fr;
+      gap: 3.5rem;
+      align-items: center;
     }
-    .voting-bars-container {
+    .qr-box {
+      background: #fbf9f4;
+      border: 1px solid var(--gold-border);
+      padding: 2rem;
+      text-align: center;
+      border-radius: 4px;
+    }
+    #qrcode {
+      display: inline-block;
+      padding: 10px;
+      background: white;
+      border: 1px solid var(--gold-subtle);
+      margin-bottom: 1.2rem;
+    }
+    #qrcode img { display: block; margin: 0 auto; }
+    .qr-caption {
+      font-family: 'Cinzel', serif;
+      font-size: 1rem;
+      letter-spacing: 1.5px;
+      color: var(--pine);
+      font-weight: 700;
+    }
+    .qr-url {
+      font-family: monospace;
+      font-size: 0.9rem;
+      color: var(--gold);
+      margin-top: 0.4rem;
+    }
+
+    .lobby-details h1 {
+      font-family: 'Playfair Display', serif;
+      font-size: 3.2rem;
+      line-height: 1.15;
+      color: var(--pine);
+      margin-bottom: 1rem;
+      font-style: italic;
+    }
+    .lobby-details p {
+      font-size: 1.15rem;
+      color: var(--text-muted);
+      line-height: 1.6;
+      margin-bottom: 2rem;
+    }
+    .guest-stat-box {
+      display: flex;
+      align-items: baseline;
+      gap: 1rem;
+      margin-bottom: 2.2rem;
+    }
+    .guest-stat-num {
+      font-size: 4rem;
+      font-weight: 700;
+      color: var(--gold);
+      font-family: 'Playfair Display', serif;
+    }
+    .guest-stat-label {
+      font-family: 'Cinzel', serif;
+      font-size: 1.1rem;
+      letter-spacing: 1px;
+      color: var(--pine);
+    }
+    .btn-gold-primary {
+      background: var(--gold);
+      color: #fff;
+      border: 1px solid #9c732e;
+      padding: 1rem 2.5rem;
+      font-family: 'Cinzel', serif;
+      font-size: 1.1rem;
+      letter-spacing: 2px;
+      cursor: pointer;
+      box-shadow: 0 4px 15px rgba(184, 141, 67, 0.3);
+      transition: all 0.2s;
+    }
+    .btn-gold-primary:hover {
+      background: #a47b34;
+      transform: translateY(-1px);
+    }
+
+    /* 2. QUESTION VIEW */
+    .question-card-inner {
+      text-align: center;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    .q-top-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 2rem;
+      border-bottom: 1px solid var(--gold-subtle);
+      padding-bottom: 1rem;
+    }
+    .q-counter-tag {
+      font-family: 'Cinzel', serif;
+      font-size: 0.95rem;
+      letter-spacing: 2px;
+      color: var(--gold);
+      text-transform: uppercase;
+    }
+    .q-timer-badge {
+      font-family: 'Playfair Display', serif;
+      font-size: 1.8rem;
+      color: var(--pine);
+      font-weight: 700;
+    }
+    .question-statement {
+      font-family: 'Playfair Display', serif;
+      font-size: 3.4rem;
+      line-height: 1.25;
+      color: var(--pine);
+      margin: 2.5rem 0;
+      font-style: italic;
+    }
+    .live-voted-strip {
+      background: #fbf9f4;
+      border: 1px solid var(--gold-subtle);
+      padding: 1rem 1.5rem;
+      border-radius: 4px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+    .voted-progress-track {
+      flex: 1;
+      height: 8px;
+      background: #eee3cc;
+      margin: 0 1.5rem;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .voted-progress-fill {
+      height: 100%;
+      background: var(--pine);
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+
+    /* 3. REVEAL VIEW */
+    .reveal-header {
+      text-align: center;
+      margin-bottom: 2.5rem;
+    }
+    .official-answer-badge {
+      font-family: 'Cinzel', serif;
+      font-size: 0.85rem;
+      letter-spacing: 3px;
+      color: var(--gold);
+      text-transform: uppercase;
+      margin-bottom: 0.5rem;
+    }
+    .reveal-title {
+      font-family: 'Playfair Display', serif;
+      font-size: 3.6rem;
+      color: var(--pine);
+      font-style: italic;
+    }
+    .comparison-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 2.5rem;
-      width: 100%;
     }
-    .candidate-card {
-      background: var(--card-bg);
-      border-radius: 24px;
+    .person-result-box {
+      border: 1px solid var(--gold-border);
       padding: 2.5rem;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
       text-align: center;
+      background: #fcfaf6;
+      border-radius: 4px;
       position: relative;
-      overflow: hidden;
-      border: 2px solid transparent;
-      transition: transform 0.3s ease;
     }
-    .candidate-card.groom { border-color: rgba(37, 99, 235, 0.5); }
-    .candidate-card.bride { border-color: rgba(244, 63, 94, 0.5); }
-    .candidate-card.is-winner {
+    .person-result-box.is-official {
+      background: #f7f1e4;
       border-color: var(--gold);
-      box-shadow: 0 0 40px rgba(212, 175, 55, 0.4);
-      transform: scale(1.03);
+      box-shadow: inset 0 0 0 2px var(--gold);
     }
-    .winner-ribbon {
+    .official-crown {
       display: none;
       position: absolute;
-      top: 15px; right: 15px;
+      top: 12px; right: 12px;
+      font-family: 'Cinzel', serif;
+      font-size: 0.75rem;
+      letter-spacing: 1.5px;
       background: var(--gold);
-      color: #000;
-      padding: 0.3rem 0.9rem;
-      border-radius: 999px;
-      font-weight: 800;
-      font-size: 0.85rem;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
+      color: #fff;
+      padding: 0.25rem 0.75rem;
+      border-radius: 2px;
     }
-    .candidate-card.is-winner .winner-ribbon { display: block; }
-    .candidate-name {
-      font-size: 2.4rem;
-      font-weight: 800;
+    .person-result-box.is-official .official-crown { display: block; }
+    .person-role {
+      font-family: 'Cinzel', serif;
+      font-size: 0.85rem;
+      letter-spacing: 2px;
+      color: var(--text-muted);
+      text-transform: uppercase;
       margin-bottom: 0.3rem;
     }
-    .candidate-role {
-      font-size: 1.1rem;
-      color: var(--text-muted);
-      margin-bottom: 1.5rem;
+    .person-name {
+      font-family: 'Playfair Display', serif;
+      font-size: 2.5rem;
+      color: var(--pine);
+      margin-bottom: 1rem;
     }
-    .candidate-pct {
-      font-size: 5rem;
-      font-weight: 800;
+    .person-pct {
+      font-size: 4.5rem;
+      font-weight: 700;
+      color: var(--pine);
       line-height: 1;
-      margin-bottom: 0.6rem;
+      margin-bottom: 0.5rem;
+      font-family: 'Playfair Display', serif;
     }
-    .groom .candidate-pct { color: #60a5fa; }
-    .bride .candidate-pct { color: #fb7185; }
-    .candidate-votes {
-      font-size: 1.2rem;
+    .person-votes {
+      font-size: 1.05rem;
       color: var(--text-muted);
-      font-weight: 600;
     }
 
-    /* LEADERBOARD VIEW */
-    .leaderboard-container {
-      width: 100%;
-      max-width: 900px;
-      background: var(--card-bg);
-      border: 1px solid rgba(212, 175, 55, 0.3);
-      border-radius: 28px;
-      padding: 2.5rem 3.5rem;
-      box-shadow: 0 25px 60px rgba(0,0,0,0.5);
+    /* 4. LEADERBOARD VIEW */
+    .lb-wrapper {
+      max-width: 820px;
+      margin: 0 auto;
     }
-    .lb-header {
+    .lb-header-box {
       text-align: center;
       margin-bottom: 2rem;
     }
-    .lb-header h2 {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 3rem;
-      color: var(--gold-light);
+    .lb-header-box h2 {
+      font-family: 'Playfair Display', serif;
+      font-size: 2.8rem;
+      color: var(--pine);
+      font-style: italic;
     }
-    .lb-list {
+    .lb-table {
       display: flex;
       flex-direction: column;
-      gap: 0.8rem;
+      gap: 0.7rem;
     }
-    .lb-row {
+    .lb-item {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 1rem 1.6rem;
-      background: rgba(255, 255, 255, 0.04);
-      border-radius: 16px;
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      font-size: 1.25rem;
-      font-weight: 700;
-      transition: all 0.3s ease;
+      padding: 0.9rem 1.6rem;
+      background: #fcfaf6;
+      border: 1px solid var(--gold-subtle);
+      border-radius: 4px;
+      font-size: 1.15rem;
+      font-weight: 600;
     }
-    .lb-row:nth-child(1) {
-      background: linear-gradient(90deg, rgba(212, 175, 55, 0.25) 0%, rgba(255, 255, 255, 0.05) 100%);
+    .lb-item:nth-child(1) {
+      background: #f7efe0;
       border-color: var(--gold);
-      transform: scale(1.02);
     }
-    .lb-row:nth-child(2) {
-      background: linear-gradient(90deg, rgba(203, 213, 225, 0.2) 0%, rgba(255, 255, 255, 0.05) 100%);
-      border-color: #cbd5e1;
-    }
-    .lb-row:nth-child(3) {
-      background: linear-gradient(90deg, rgba(205, 127, 50, 0.2) 0%, rgba(255, 255, 255, 0.05) 100%);
-      border-color: #cd7f32;
-    }
-    .lb-left {
-      display: flex;
-      align-items: center;
-      gap: 1.2rem;
-    }
-    .lb-rank {
-      width: 38px;
-      font-size: 1.4rem;
+    .lb-item-rank {
+      font-family: 'Cinzel', serif;
+      width: 35px;
       color: var(--gold);
-    }
-    .lb-name {
-      color: #fff;
       font-weight: 700;
     }
-    .lb-score {
-      font-size: 1.4rem;
-      color: var(--gold-light);
-      font-weight: 800;
+    .lb-item-name {
+      color: var(--pine);
+      flex: 1;
+      padding-left: 0.5rem;
+    }
+    .lb-item-score {
+      font-family: 'Playfair Display', serif;
+      font-size: 1.3rem;
+      color: var(--pine);
+      font-weight: 700;
     }
 
-    /* FINAL PODIUM */
-    .podium-container {
-      width: 100%;
-      max-width: 1000px;
+    /* 5. FINAL PODIUM VIEW */
+    .podium-screen-inner {
       text-align: center;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 2.5rem;
     }
-    .podium-stage {
+    .podium-stage-row {
       display: flex;
       align-items: flex-end;
       justify-content: center;
       gap: 1.5rem;
-      width: 100%;
-      margin-top: 1rem;
+      margin-top: 2rem;
     }
-    .podium-pillar {
+    .podium-col {
       flex: 1;
-      max-width: 260px;
-      background: var(--card-bg);
-      border: 1px solid rgba(255,255,255,0.15);
-      border-radius: 20px 20px 0 0;
-      padding: 1.5rem;
+      max-width: 250px;
+      background: #fcfaf6;
+      border: 1px solid var(--gold-border);
+      border-radius: 4px 4px 0 0;
+      padding: 1.5rem 1rem;
       display: flex;
       flex-direction: column;
       align-items: center;
-      position: relative;
     }
-    .pillar-1 {
-      height: 380px;
+    .podium-1 {
+      height: 360px;
+      background: #f7efe0;
       border-color: var(--gold);
-      background: linear-gradient(180deg, rgba(212, 175, 55, 0.3) 0%, rgba(18, 24, 38, 0.9) 100%);
-      box-shadow: 0 0 50px rgba(212, 175, 55, 0.4);
+      box-shadow: inset 0 0 0 2px var(--gold);
     }
-    .pillar-2 {
-      height: 300px;
-      border-color: #94a3b8;
-      background: linear-gradient(180deg, rgba(148, 163, 184, 0.2) 0%, rgba(18, 24, 38, 0.9) 100%);
-    }
-    .pillar-3 {
-      height: 240px;
-      border-color: #cd7f32;
-      background: linear-gradient(180deg, rgba(205, 127, 50, 0.2) 0%, rgba(18, 24, 38, 0.9) 100%);
-    }
-    .podium-badge {
-      font-size: 2.8rem;
-      margin-bottom: 0.5rem;
-    }
-    .podium-name {
-      font-size: 1.6rem;
-      font-weight: 800;
-      color: #fff;
-      word-break: break-word;
-    }
-    .podium-score {
-      font-size: 1.3rem;
+    .podium-2 { height: 280px; }
+    .podium-3 { height: 220px; }
+    .podium-medal { font-size: 2.5rem; margin-bottom: 0.5rem; }
+    .podium-guest-name {
+      font-family: 'Playfair Display', serif;
+      font-size: 1.5rem;
+      color: var(--pine);
       font-weight: 700;
-      color: var(--gold-light);
-      margin-top: 0.3rem;
+    }
+    .podium-guest-score {
+      font-size: 1.15rem;
+      color: var(--gold);
+      font-weight: 600;
+      margin-top: 0.4rem;
     }
 
-    /* HOST CONTROLS BAR (AT BOTTOM) */
+    /* HOST CONTROLS BAR (ALWAYS ACCESSIBLE, NEVER GET STUCK) */
     footer {
-      position: relative;
-      z-index: 10;
+      padding: 0.9rem 3rem;
+      background: #fff;
+      border-top: 1px solid var(--gold-subtle);
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 1rem 2.5rem;
-      background: rgba(10, 13, 20, 0.8);
-      border-top: 1px solid rgba(255, 255, 255, 0.1);
-      backdrop-filter: blur(12px);
+      z-index: 10;
     }
-    .controls-left, .controls-right {
+    .ctrl-group {
       display: flex;
-      gap: 0.8rem;
+      gap: 0.6rem;
       align-items: center;
     }
-    .btn-ctrl {
-      background: rgba(255, 255, 255, 0.08);
-      color: #fff;
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      padding: 0.65rem 1.4rem;
-      border-radius: 12px;
-      font-size: 1rem;
-      font-weight: 700;
+    .btn-toolbar {
+      background: #fbf8f2;
+      border: 1px solid var(--gold-border);
+      color: var(--pine);
+      padding: 0.55rem 1rem;
+      border-radius: 3px;
+      font-size: 0.85rem;
+      font-weight: 600;
       cursor: pointer;
       display: flex;
       align-items: center;
       gap: 0.4rem;
-      transition: all 0.2s ease;
+      transition: all 0.15s;
     }
-    .btn-ctrl:hover {
-      background: rgba(255, 255, 255, 0.15);
-      transform: translateY(-1px);
-    }
-    .btn-ctrl.primary {
-      background: var(--gold);
-      color: #0b0f19;
+    .btn-toolbar:hover {
+      background: #f4ecdc;
       border-color: var(--gold);
     }
-    .btn-ctrl.primary:hover {
-      background: var(--gold-light);
+    .btn-toolbar.active-state {
+      background: var(--pine);
+      color: #fff;
+      border-color: var(--pine);
     }
-    .btn-ctrl.danger {
-      color: #fca5a5;
-      border-color: rgba(239, 68, 68, 0.3);
+    .btn-toolbar.gold {
+      background: var(--gold);
+      color: #fff;
+      border-color: #9c732e;
     }
 
-    /* AUTH PIN MODAL */
-    .modal-overlay {
+    /* GUESTS MANAGER DRAWER / MODAL */
+    .drawer-overlay {
       position: fixed;
       top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0,0,0,0.85);
-      backdrop-filter: blur(8px);
+      background: rgba(24, 47, 40, 0.4);
+      backdrop-filter: blur(4px);
+      z-index: 200;
+      display: none;
+      align-items: center;
+      justify-content: center;
+    }
+    .drawer-content {
+      background: #fff;
+      border: 1px solid var(--gold);
+      box-shadow: var(--shadow-stationery);
+      border-radius: 4px;
+      padding: 2.5rem;
+      width: 100%;
+      max-width: 580px;
+      max-height: 80vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .drawer-title {
+      font-family: 'Playfair Display', serif;
+      font-size: 1.8rem;
+      color: var(--pine);
+      margin-bottom: 0.3rem;
+      font-style: italic;
+    }
+    .guest-list-scroll {
+      flex: 1;
+      overflow-y: auto;
+      margin: 1.2rem 0;
+      border: 1px solid var(--gold-subtle);
+      border-radius: 4px;
+    }
+    .guest-list-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.75rem 1.2rem;
+      border-bottom: 1px solid #f4ecdc;
+    }
+    .guest-list-row:last-child { border-bottom: none; }
+    .btn-kick {
+      background: #fff0f0;
+      color: #b91c1c;
+      border: 1px solid #fca5a5;
+      padding: 0.3rem 0.7rem;
+      border-radius: 3px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .btn-kick:hover { background: #fee2e2; }
+
+    /* AUTH PIN MODAL */
+    #pinModal {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(24, 47, 40, 0.6);
+      backdrop-filter: blur(6px);
       display: flex;
       align-items: center;
       justify-content: center;
-      z-index: 1000;
+      z-index: 300;
     }
-    .modal-box {
-      background: #111827;
+    .pin-card {
+      background: #fff;
       border: 1px solid var(--gold);
-      border-radius: 24px;
       padding: 3rem;
-      width: 100%;
+      text-align: center;
       max-width: 420px;
-      text-align: center;
-      box-shadow: 0 25px 60px rgba(0,0,0,0.8);
+      border-radius: 4px;
+      box-shadow: var(--shadow-stationery);
     }
-    .modal-box h2 {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 2.4rem;
-      color: var(--gold-light);
-      margin-bottom: 0.5rem;
-    }
-    .modal-box p {
-      color: var(--text-muted);
-      margin-bottom: 1.5rem;
-    }
-    .pin-input {
-      width: 100%;
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.2);
-      border-radius: 12px;
-      font-size: 1.8rem;
-      text-align: center;
-      color: #fff;
-      padding: 0.8rem;
-      letter-spacing: 6px;
-      margin-bottom: 1.5rem;
-      outline: none;
-    }
-    .pin-input:focus { border-color: var(--gold); }
   </style>
 </head>
 <body>
-  <div class="ambient-glow"></div>
+  <div class="stationery-frame"></div>
 
   <!-- PIN AUTH MODAL -->
-  <div id="pinModal" class="modal-overlay">
-    <div class="modal-box">
-      <h2>Host Access</h2>
-      <p>Enter Host PIN to manage the quiz</p>
-      <input type="password" id="pinInput" class="pin-input" placeholder="••••" maxlength="8" autofocus>
-      <button class="btn-start" style="width: 100%;" onclick="submitHostPin()">Unlock Host</button>
-      <div id="pinError" style="color: #ef4444; margin-top: 1rem; font-weight: 600; display: none;">Invalid PIN</div>
+  <div id="pinModal">
+    <div class="pin-card">
+      <div class="card-ornament">◆ ✦ ◆</div>
+      <h2 style="font-family: 'Playfair Display', serif; font-size: 2.2rem; margin-bottom: 0.5rem; font-style: italic;">Host Access</h2>
+      <p style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 1.5rem;">Enter Host PIN to manage the wedding quiz</p>
+      <input type="password" id="pinInput" style="width: 100%; border: 1px solid var(--gold-border); padding: 0.8rem; font-size: 1.6rem; text-align: center; letter-spacing: 5px; outline: none; margin-bottom: 1.5rem;" placeholder="••••" autofocus>
+      <button class="btn-gold-primary" style="width: 100%;" onclick="submitHostPin()">Unlock Host</button>
+      <div id="pinError" style="color: #b91c1c; font-size: 0.9rem; font-weight: 600; margin-top: 1rem; display: none;">Invalid PIN</div>
     </div>
   </div>
 
-  <header>
-    <div class="brand">💍 Aumre &amp; Joudy <span>Quiz</span></div>
-    <div class="header-stats">
-      <div class="stat-pill">
-        <span class="dot"></span>
-        <span id="headerPlayerCount">0 Guests Online</span>
+  <!-- GUEST MANAGER DRAWER -->
+  <div id="drawerGuests" class="drawer-overlay" onclick="closeGuestDrawer(event)">
+    <div class="drawer-content" onclick="event.stopPropagation()">
+      <div class="card-ornament">◆ ✦ ◆</div>
+      <h2 class="drawer-title">Joined Guests</h2>
+      <p style="color: var(--text-muted); font-size: 0.9rem;">Review registered players or remove inappropriate entries</p>
+      <div class="guest-list-scroll" id="guestListContainer">
+        <!-- Dynamically rendered -->
       </div>
-      <button class="btn-ctrl" onclick="toggleSound()" id="soundBtn">🔊 Sound: ON</button>
-      <button class="btn-ctrl" onclick="toggleFullscreen()">⛶ Fullscreen</button>
+      <button class="pill-btn" style="justify-content: center;" onclick="closeGuestDrawer()">Close</button>
+    </div>
+  </div>
+
+  <!-- HEADER -->
+  <header>
+    <div class="header-branding">
+      <span class="header-super">Welcome to the Wedding of</span>
+      <h1 class="header-title">Aumre <span>&amp;</span> Joudy</h1>
+    </div>
+    <div class="header-actions">
+      <button class="pill-btn" onclick="openGuestDrawer()">
+        <span class="dot-live"></span>
+        <span id="headerPlayerCount">0 Guests</span>
+      </button>
+      <button class="pill-btn" id="soundBtn" onclick="toggleSound()">🔊 Sound: ON</button>
+      <button class="pill-btn" onclick="toggleFullscreen()">⛶ Fullscreen</button>
     </div>
   </header>
 
+  <!-- AUTO-FLOW INDICATOR BAR -->
+  <div class="flow-indicator">
+    <span id="flowPhaseLabel">LOBBY</span>
+    <div class="flow-bar">
+      <div class="flow-bar-inner" id="flowBarProgress"></div>
+    </div>
+    <span id="flowTimerNumber">Ready</span>
+  </div>
+
+  <!-- MAIN VIEWS -->
   <main>
     <!-- 1. LOBBY VIEW -->
     <div id="viewLobby" class="view active">
-      <div class="lobby-container">
-        <div class="qr-card">
+      <div class="stationery-card lobby-layout">
+        <div class="qr-box">
           <div id="qrcode"></div>
-          <p>Scan with your phone to join!</p>
-          <div class="url-pill" id="qrUrlText">Loading...</div>
+          <div class="qr-caption">Scan with Phone to Join</div>
+          <div class="qr-url" id="qrUrlText">Loading...</div>
         </div>
-        <div class="lobby-info">
-          <h1 class="lobby-title">How Well Do You Know The Couple?</h1>
-          <p class="lobby-subtitle">Connect on your smartphone, answer fast, and compete for the top of the wedding leaderboard!</p>
-          <div class="guest-counter">
-            <span class="num" id="lobbyCount">0</span>
-            <span class="label">Guests in Lobby</span>
+        <div class="lobby-details">
+          <div class="card-ornament" style="text-align: left;">◆ ✦ ◆</div>
+          <h1>How Well Do You Know Aumre &amp; Joudy?</h1>
+          <p>Scan the QR code on your mobile device, enter your name, and answer each question for points!</p>
+          <div class="guest-stat-box">
+            <span class="guest-stat-num" id="lobbyCount">0</span>
+            <span class="guest-stat-label">Guests in Lobby</span>
           </div>
-          <button class="btn-start" onclick="hostAction('START_GAME')">Start Quiz &rarr;</button>
+          <button class="btn-gold-primary" onclick="hostAction('START_GAME')">Start Quiz &rarr;</button>
         </div>
       </div>
     </div>
 
     <!-- 2. QUESTION VIEW -->
     <div id="viewQuestion" class="view">
-      <div class="question-screen">
-        <div class="q-top-bar">
-          <div class="q-counter-badge" id="questionBadge">Question 1 of 20</div>
-          <div class="timer-circle">
-            <svg>
-              <circle class="timer-bg" cx="50" cy="50" r="42"></circle>
-              <circle class="timer-progress" id="timerProgressCircle" cx="50" cy="50" r="42"></circle>
-            </svg>
-            <div class="timer-text" id="timerDisplay">20</div>
-          </div>
+      <div class="stationery-card question-card-inner">
+        <div class="card-ornament">◆ ✦ ◆</div>
+        <div class="q-top-meta">
+          <span class="q-counter-tag" id="questionBadge">Question 1 of 20</span>
+          <span class="q-timer-badge" id="questionTimer">20s</span>
         </div>
-
-        <div class="question-box">
-          <h2 id="questionText">Who is more likely to...?</h2>
-        </div>
-
-        <div class="live-progress-bar-container">
-          <div class="bar-labels">
-            <span>Live Guest Answers</span>
-            <span id="answeredRatio">0 / 0 Answered</span>
+        <h2 class="question-statement" id="questionText">Who is more likely to...?</h2>
+        <div class="live-voted-strip">
+          <span>Live Responses</span>
+          <div class="voted-progress-track">
+            <div class="voted-progress-fill" id="answeredProgressFill"></div>
           </div>
-          <div class="bar-track">
-            <div class="bar-fill" id="answeredProgressFill"></div>
-          </div>
+          <span id="answeredRatio">0 / 0 Answered</span>
         </div>
       </div>
     </div>
 
     <!-- 3. REVEAL VIEW -->
     <div id="viewReveal" class="view">
-      <div class="reveal-card">
-        <div class="winner-announcement">
-          <div class="badge">Official Couple Answer</div>
-          <h1 id="revealVerdictTitle">It's Joudy!</h1>
+      <div class="stationery-card" style="max-width: 950px; margin: 0 auto;">
+        <div class="card-ornament">◆ ✦ ◆</div>
+        <div class="reveal-header">
+          <div class="official-answer-badge">Official Answer</div>
+          <h2 class="reveal-title" id="revealTitle">It's Joudy!</h2>
         </div>
-
-        <div class="voting-bars-container">
-          <!-- AUMRE -->
-          <div class="candidate-card groom" id="cardAumre">
-            <div class="winner-ribbon">👑 Verified</div>
-            <div class="candidate-name">🤵 Aumre</div>
-            <div class="candidate-role">The Groom</div>
-            <div class="candidate-pct" id="pctAumre">0%</div>
-            <div class="candidate-votes" id="votesAumre">0 votes</div>
+        <div class="comparison-grid">
+          <!-- Aumre -->
+          <div class="person-result-box" id="cardAumre">
+            <div class="official-crown">👑 Official Answer</div>
+            <div class="person-role">The Groom 🤵</div>
+            <div class="person-name">Aumre</div>
+            <div class="person-pct" id="pctAumre">0%</div>
+            <div class="person-votes" id="votesAumre">0 votes</div>
           </div>
-
-          <!-- JOUDY -->
-          <div class="candidate-card bride" id="cardJoudy">
-            <div class="winner-ribbon">👑 Verified</div>
-            <div class="candidate-name">👰 Joudy</div>
-            <div class="candidate-role">The Bride</div>
-            <div class="candidate-pct" id="pctJoudy">0%</div>
-            <div class="candidate-votes" id="votesJoudy">0 votes</div>
+          <!-- Joudy -->
+          <div class="person-result-box" id="cardJoudy">
+            <div class="official-crown">👑 Official Answer</div>
+            <div class="person-role">The Bride 👰</div>
+            <div class="person-name">Joudy</div>
+            <div class="person-pct" id="pctJoudy">0%</div>
+            <div class="person-votes" id="votesJoudy">0 votes</div>
           </div>
         </div>
       </div>
@@ -1332,12 +1356,13 @@ const HOST_HTML = `<!DOCTYPE html>
 
     <!-- 4. LEADERBOARD VIEW -->
     <div id="viewLeaderboard" class="view">
-      <div class="leaderboard-container">
-        <div class="lb-header">
-          <h2>🏆 Top Guests</h2>
-          <p style="color: var(--text-muted);">Points awarded for speed and accuracy!</p>
+      <div class="stationery-card lb-wrapper">
+        <div class="card-ornament">◆ ✦ ◆</div>
+        <div class="lb-header-box">
+          <div class="official-answer-badge">Wedding Standings</div>
+          <h2>Top Guests</h2>
         </div>
-        <div class="lb-list" id="leaderboardList">
+        <div class="lb-table" id="leaderboardList">
           <!-- Dynamically populated -->
         </div>
       </div>
@@ -1345,44 +1370,45 @@ const HOST_HTML = `<!DOCTYPE html>
 
     <!-- 5. FINAL PODIUM VIEW -->
     <div id="viewFinal" class="view">
-      <div class="podium-container">
-        <h1 style="font-family: 'Cormorant Garamond', serif; font-size: 3.8rem; color: var(--gold-light);">
-          ✨ Grand Winners! ✨
-        </h1>
-        <div class="podium-stage">
-          <!-- 2nd Place -->
-          <div class="podium-pillar pillar-2">
-            <div class="podium-badge">🥈</div>
-            <div class="podium-name" id="podium2Name">-</div>
-            <div class="podium-score" id="podium2Score">0 pts</div>
+      <div class="stationery-card podium-screen-inner" style="max-width: 900px; margin: 0 auto;">
+        <div class="card-ornament">◆ ✦ ◆</div>
+        <div class="official-answer-badge">Congratulations</div>
+        <h2 style="font-family: 'Playfair Display', serif; font-size: 3.2rem; color: var(--pine); font-style: italic;">
+          Grand Winners!
+        </h2>
+        <div class="podium-stage-row">
+          <div class="podium-col podium-2">
+            <div class="podium-medal">🥈</div>
+            <div class="podium-guest-name" id="podium2Name">-</div>
+            <div class="podium-guest-score" id="podium2Score">0 pts</div>
           </div>
-          <!-- 1st Place -->
-          <div class="podium-pillar pillar-1">
-            <div class="podium-badge">👑</div>
-            <div class="podium-name" id="podium1Name">-</div>
-            <div class="podium-score" id="podium1Score">0 pts</div>
+          <div class="podium-col podium-1">
+            <div class="podium-medal">👑</div>
+            <div class="podium-guest-name" id="podium1Name">-</div>
+            <div class="podium-guest-score" id="podium1Score">0 pts</div>
           </div>
-          <!-- 3rd Place -->
-          <div class="podium-pillar pillar-3">
-            <div class="podium-badge">🥉</div>
-            <div class="podium-name" id="podium3Name">-</div>
-            <div class="podium-score" id="podium3Score">0 pts</div>
+          <div class="podium-col podium-3">
+            <div class="podium-medal">🥉</div>
+            <div class="podium-guest-name" id="podium3Name">-</div>
+            <div class="podium-guest-score" id="podium3Score">0 pts</div>
           </div>
         </div>
       </div>
     </div>
   </main>
 
+  <!-- ALWAYS-ACCESSIBLE HOST CONTROLS BAR (NEVER GET STUCK) -->
   <footer>
-    <div class="controls-left">
-      <button class="btn-ctrl danger" onclick="confirmReset()">🔄 Reset Game</button>
-      <button class="btn-ctrl" onclick="hostAction('PREV_QUESTION')">&#9664; Prev</button>
-      <button class="btn-ctrl" onclick="hostAction('PAUSE_RESUME_TIMER')">⏸ Pause/Play</button>
+    <div class="ctrl-group">
+      <button class="btn-toolbar" onclick="hostAction('TOGGLE_PAUSE')" id="pauseBtn">⏸ Pause Auto-Flow</button>
+      <button class="btn-toolbar" onclick="hostAction('BACK_TO_QUESTION')" id="btnNavQ">&#8592; Back to Question</button>
+      <button class="btn-toolbar" onclick="hostAction('REVEAL_NOW')" id="btnNavReveal">⚡ Reveal Official Answer</button>
+      <button class="btn-toolbar" onclick="hostAction('SHOW_LEADERBOARD')" id="btnNavLB">🏆 Leaderboard</button>
     </div>
-    <div class="controls-right">
-      <button class="btn-ctrl" onclick="hostAction('REVEAL_NOW')" id="ctrlRevealBtn">⚡ Reveal Now</button>
-      <button class="btn-ctrl" onclick="hostAction('SHOW_LEADERBOARD')">🏆 Leaderboard</button>
-      <button class="btn-ctrl primary" onclick="hostAction('NEXT_QUESTION')" id="ctrlNextBtn">Next Question &rarr;</button>
+    <div class="ctrl-group">
+      <button class="btn-toolbar" onclick="hostAction('PREV_QUESTION')">&#9664; Prev Q</button>
+      <button class="btn-toolbar gold" onclick="hostAction('NEXT_QUESTION')">Next Q &rarr;</button>
+      <button class="btn-toolbar" style="color: #b91c1c;" onclick="confirmReset()">Reset</button>
     </div>
   </footer>
 
@@ -1390,17 +1416,14 @@ const HOST_HTML = `<!DOCTYPE html>
     let ws = null;
     let soundEnabled = true;
     let audioCtx = null;
-    let lastStatus = '';
+    let currentHostState = null;
+    let guestListCache = [];
 
-    // Auto-detect URL parameter ?pin=...
     const urlParams = new URLSearchParams(window.location.search);
     let currentPin = urlParams.get('pin') || localStorage.getItem('wedding_host_pin') || '';
 
-    // --- SYNTHESIZED AUDIO (NO EXTERNAL AUDIO FILES) ---
     function initAudio() {
-      if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      }
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     }
 
     function playTone(freq, duration = 0.1, type = 'sine') {
@@ -1411,7 +1434,7 @@ const HOST_HTML = `<!DOCTYPE html>
         const gain = audioCtx.createGain();
         osc.type = type;
         osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
-        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.12, audioCtx.currentTime);
         gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
         osc.connect(gain);
         gain.connect(audioCtx.destination);
@@ -1420,17 +1443,16 @@ const HOST_HTML = `<!DOCTYPE html>
       } catch(e) {}
     }
 
-    function playTick() { playTone(880, 0.05, 'triangle'); }
+    function playTick() { playTone(784, 0.05, 'triangle'); }
     function playReveal() {
-      playTone(523.25, 0.2); // C5
-      setTimeout(() => playTone(659.25, 0.2), 120); // E5
-      setTimeout(() => playTone(783.99, 0.4), 240); // G5
-      setTimeout(() => playTone(1046.50, 0.6), 360); // C6
+      playTone(523.25, 0.2);
+      setTimeout(() => playTone(659.25, 0.2), 100);
+      setTimeout(() => playTone(783.99, 0.3), 200);
+      setTimeout(() => playTone(1046.50, 0.5), 300);
     }
     function playFanfare() {
-      const notes = [440, 554.37, 659.25, 880, 1108.73];
-      notes.forEach((freq, idx) => {
-        setTimeout(() => playTone(freq, 0.35, 'triangle'), idx * 150);
+      [440, 554.37, 659.25, 880, 1108.73].forEach((f, i) => {
+        setTimeout(() => playTone(f, 0.3, 'triangle'), i * 140);
       });
     }
 
@@ -1447,7 +1469,6 @@ const HOST_HTML = `<!DOCTYPE html>
       }
     }
 
-    // --- QR CODE GENERATION ---
     function setupQRCode() {
       const playerUrl = window.location.origin + '/';
       document.getElementById('qrUrlText').textContent = playerUrl;
@@ -1458,17 +1479,15 @@ const HOST_HTML = `<!DOCTYPE html>
           text: playerUrl,
           width: 200,
           height: 200,
-          colorDark: "#0f172a",
+          colorDark: "#182f28",
           colorLight: "#ffffff",
           correctLevel: QRCode.CorrectLevel.M
         });
       } else {
-        // Fallback to QR Image API if CDN fails
         qrEl.innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(playerUrl) + '" alt="QR Code">';
       }
     }
 
-    // --- WEBSOCKET CONNECTION ---
     function connectWS() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       ws = new WebSocket(protocol + '//' + window.location.host);
@@ -1483,16 +1502,13 @@ const HOST_HTML = `<!DOCTYPE html>
 
       ws.onmessage = (event) => {
         try {
-          const msg = JSON.parse(event.data);
-          handleServerMessage(msg);
+          handleServerMessage(JSON.parse(event.data));
         } catch (e) {
           console.error(e);
         }
       };
 
-      ws.onclose = () => {
-        setTimeout(connectWS, 2000);
-      };
+      ws.onclose = () => { setTimeout(connectWS, 2000); };
     }
 
     function submitHostPin() {
@@ -1511,26 +1527,32 @@ const HOST_HTML = `<!DOCTYPE html>
         setupQRCode();
         return;
       }
-
       if (msg.type === 'HOST_AUTH_FAIL') {
         document.getElementById('pinError').style.display = 'block';
         return;
       }
-
       if (msg.type === 'TIMER_TICK') {
-        updateTimer(msg.timeRemaining);
-        if (msg.timeRemaining <= 5 && msg.timeRemaining > 0) playTick();
+        updateTimerBar(msg);
         return;
       }
-
-      if (msg.type === 'ALL_ANSWERED') {
-        // Subtle cue that all active players have finished answering
-        document.getElementById('ctrlRevealBtn').style.boxShadow = '0 0 20px #10b981';
-        return;
-      }
-
       if (msg.type === 'HOST_STATE_UPDATE') {
+        currentHostState = msg;
         renderHostState(msg);
+      }
+    }
+
+    function updateTimerBar(tick) {
+      const timeRemaining = tick.timeRemaining;
+      const maxTime = tick.maxTime || 20;
+      const pct = maxTime > 0 ? (timeRemaining / maxTime) * 100 : 0;
+      document.getElementById('flowBarProgress').style.width = pct + '%';
+      
+      const pausedText = tick.isPaused ? ' (PAUSED)' : '';
+      document.getElementById('flowTimerNumber').textContent = timeRemaining + 's' + pausedText;
+      document.getElementById('questionTimer').textContent = timeRemaining + 's';
+
+      if (tick.status === 'QUESTION' && timeRemaining <= 5 && timeRemaining > 0 && !tick.isPaused) {
+        playTick();
       }
     }
 
@@ -1540,70 +1562,51 @@ const HOST_HTML = `<!DOCTYPE html>
       if (target) target.classList.add('active');
     }
 
-    function updateTimer(seconds) {
-      document.getElementById('timerDisplay').textContent = seconds;
-      const circle = document.getElementById('timerProgressCircle');
-      const maxTime = 20;
-      const circumference = 264;
-      const offset = circumference - ((seconds / maxTime) * circumference);
-      circle.style.strokeDashoffset = offset;
-      if (seconds <= 5) {
-        circle.style.stroke = '#ef4444';
-      } else {
-        circle.style.stroke = '#d4af37';
-      }
-    }
-
     function renderHostState(data) {
-      // Header & Counts
       document.getElementById('headerPlayerCount').textContent = data.totalActivePlayers + ' Guests Online';
       document.getElementById('lobbyCount').textContent = data.totalRegisteredPlayers;
+      guestListCache = data.guestList || [];
+      renderGuestDrawerList();
 
-      // Switch views based on status
-      if (data.status !== lastStatus) {
-        lastStatus = data.status;
-        if (data.status === 'LOBBY') switchView('viewLobby');
-        if (data.status === 'QUESTION') switchView('viewQuestion');
-        if (data.status === 'REVEAL') {
-          switchView('viewReveal');
-          playReveal();
-        }
-        if (data.status === 'LEADERBOARD') switchView('viewLeaderboard');
-        if (data.status === 'FINAL') {
-          switchView('viewFinal');
-          triggerConfetti();
-          playFanfare();
-        }
+      // Update Pause button text
+      const pauseBtn = document.getElementById('pauseBtn');
+      if (data.isPaused) {
+        pauseBtn.textContent = '▶ Resume Auto-Flow';
+        pauseBtn.classList.add('gold');
+      } else {
+        pauseBtn.textContent = '⏸ Pause Auto-Flow';
+        pauseBtn.classList.remove('gold');
       }
 
-      // 1. QUESTION VIEW
+      // Update navigation active highlight in footer
+      document.getElementById('btnNavQ').classList.toggle('active-state', data.status === 'QUESTION');
+      document.getElementById('btnNavReveal').classList.toggle('active-state', data.status === 'REVEAL');
+      document.getElementById('btnNavLB').classList.toggle('active-state', data.status === 'LEADERBOARD');
+
+      // Update flow phase label
+      document.getElementById('flowPhaseLabel').textContent = data.status + (data.isPaused ? ' (PAUSED)' : '');
+
+      if (data.status === 'LOBBY') switchView('viewLobby');
       if (data.status === 'QUESTION') {
+        switchView('viewQuestion');
         document.getElementById('questionBadge').textContent = 'Question ' + (data.questionIndex + 1) + ' of ' + data.totalQuestions;
         document.getElementById('questionText').textContent = data.currentQuestion ? data.currentQuestion.question : '';
-        updateTimer(data.timeRemaining);
-
-        // Progress
-        const ratioText = data.answeredCount + ' / ' + data.totalActivePlayers + ' Answered';
-        document.getElementById('answeredRatio').textContent = ratioText;
+        const ratio = data.answeredCount + ' / ' + data.totalActivePlayers + ' Answered';
+        document.getElementById('answeredRatio').textContent = ratio;
         const pct = data.totalActivePlayers > 0 ? (data.answeredCount / data.totalActivePlayers) * 100 : 0;
         document.getElementById('answeredProgressFill').style.width = Math.min(100, pct) + '%';
       }
 
-      // 2. REVEAL VIEW
       if (data.status === 'REVEAL') {
+        switchView('viewReveal');
+        playReveal();
         const correct = data.currentQuestion.correctAnswer;
-        document.getElementById('revealVerdictTitle').textContent = "It's " + correct + '!';
+        document.getElementById('revealTitle').textContent = "Official Answer: " + correct;
 
         const aumreCard = document.getElementById('cardAumre');
         const joudyCard = document.getElementById('cardJoudy');
-
-        if (correct === 'Aumre') {
-          aumreCard.classList.add('is-winner');
-          joudyCard.classList.remove('is-winner');
-        } else {
-          joudyCard.classList.add('is-winner');
-          aumreCard.classList.remove('is-winner');
-        }
+        aumreCard.classList.toggle('is-official', correct === 'Aumre');
+        joudyCard.classList.toggle('is-official', correct === 'Joudy');
 
         document.getElementById('pctAumre').textContent = data.votingStats.aumrePct + '%';
         document.getElementById('votesAumre').textContent = data.votingStats.aumreVotes + ' votes';
@@ -1611,27 +1614,27 @@ const HOST_HTML = `<!DOCTYPE html>
         document.getElementById('votesJoudy').textContent = data.votingStats.joudyVotes + ' votes';
       }
 
-      // 3. LEADERBOARD VIEW
       if (data.status === 'LEADERBOARD') {
+        switchView('viewLeaderboard');
         const lbEl = document.getElementById('leaderboardList');
         lbEl.innerHTML = '';
         data.leaderboard.forEach((p, idx) => {
           const row = document.createElement('div');
-          row.className = 'lb-row';
+          row.className = 'lb-item';
           const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : '#' + (idx + 1);
           row.innerHTML = \`
-            <div class="lb-left">
-              <span class="lb-rank">\${medal}</span>
-              <span class="lb-name">\${escapeHtml(p.nickname)}</span>
-            </div>
-            <div class="lb-score">\${p.score.toLocaleString()} pts</div>
+            <span class="lb-item-rank">\${medal}</span>
+            <span class="lb-item-name">\${escapeHtml(p.nickname)}</span>
+            <span class="lb-item-score">\${p.score.toLocaleString()} pts</span>
           \`;
           lbEl.appendChild(row);
         });
       }
 
-      // 4. FINAL PODIUM VIEW
       if (data.status === 'FINAL') {
+        switchView('viewFinal');
+        if (typeof confetti === 'function') confetti({ particleCount: 150, spread: 80 });
+        playFanfare();
         const top = data.leaderboard;
         if (top[0]) {
           document.getElementById('podium1Name').textContent = top[0].nickname;
@@ -1648,22 +1651,46 @@ const HOST_HTML = `<!DOCTYPE html>
       }
     }
 
-    function hostAction(action) {
+    function renderGuestDrawerList() {
+      const el = document.getElementById('guestListContainer');
+      if (!el) return;
+      if (!guestListCache || guestListCache.length === 0) {
+        el.innerHTML = '<div style="padding: 1.5rem; text-align: center; color: var(--text-muted);">No guests connected yet.</div>';
+        return;
+      }
+      el.innerHTML = '';
+      guestListCache.forEach(g => {
+        const row = document.createElement('div');
+        row.className = 'guest-list-row';
+        row.innerHTML = \`
+          <div>
+            <span style="font-weight: 700; color: var(--pine);">\${escapeHtml(g.nickname)}</span>
+            <span style="font-size: 0.8rem; color: var(--text-muted); margin-left: 0.5rem;">(\${g.score} pts \${g.connected ? '• online' : '• offline'})</span>
+          </div>
+          <button class="btn-kick" onclick="kickGuest('\${g.id}')">Kick</button>
+        \`;
+        el.appendChild(row);
+      });
+    }
+
+    function openGuestDrawer() { document.getElementById('drawerGuests').style.display = 'flex'; }
+    function closeGuestDrawer() { document.getElementById('drawerGuests').style.display = 'none'; }
+
+    function kickGuest(playerId) {
+      if (confirm('Kick this player from the game?')) {
+        hostAction('KICK_PLAYER', { playerId });
+      }
+    }
+
+    function hostAction(action, extra = {}) {
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ action }));
+        ws.send(JSON.stringify({ action, ...extra }));
       }
     }
 
     function confirmReset() {
-      if (confirm("Reset the wedding quiz back to lobby? All current scores will reset!")) {
+      if (confirm("Reset the wedding quiz back to lobby? All scores will reset!")) {
         hostAction('RESET_GAME');
-      }
-    }
-
-    function triggerConfetti() {
-      if (typeof confetti === 'function') {
-        confetti({ particleCount: 120, spread: 80, origin: { y: 0.6 } });
-        setTimeout(() => confetti({ particleCount: 150, spread: 100, origin: { y: 0.4 } }), 500);
       }
     }
 
@@ -1673,21 +1700,17 @@ const HOST_HTML = `<!DOCTYPE html>
       });
     }
 
-    // Keyboard shortcuts for Host
+    // Spacebar toggles Pause / Resume or advances cleanly
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT') return;
       if (e.code === 'Space') {
         e.preventDefault();
-        if (lastStatus === 'LOBBY') hostAction('START_GAME');
-        else if (lastStatus === 'QUESTION') hostAction('REVEAL_NOW');
-        else if (lastStatus === 'REVEAL') hostAction('SHOW_LEADERBOARD');
-        else if (lastStatus === 'LEADERBOARD') hostAction('NEXT_QUESTION');
+        hostAction('TOGGLE_PAUSE');
       } else if (e.code === 'KeyF') {
         toggleFullscreen();
       }
     });
 
-    // Start
     connectWS();
   </script>
 </body>
@@ -1696,6 +1719,7 @@ const HOST_HTML = `<!DOCTYPE html>
 
 // ============================================================================
 // FRONTEND: MOBILE PLAYER VIEW (/)
+// Luxury Wedding Stationery (Ivory, Gold Hairline, Forest Slate & Dusty Rose)
 // ============================================================================
 const PLAYER_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -1703,80 +1727,88 @@ const PLAYER_HTML = `<!DOCTYPE html>
   <meta charset="UTF-8">
   <title>Aumre & Joudy Wedding Quiz</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <meta name="theme-color" content="#0a0d14">
+  <meta name="theme-color" content="#fbf8f2">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,600;0,700;1,600&family=Plus+Jakarta+Sans:wght@500;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Playfair+Display:ital,wght@0,600;0,700;1,500;1,600&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #090c12;
-      --card: rgba(22, 28, 44, 0.9);
-      --gold: #d4af37;
-      --gold-light: #fef3c7;
-      --groom: #2563eb;
-      --groom-glow: rgba(37, 99, 235, 0.4);
-      --bride: #f43f5e;
-      --bride-glow: rgba(244, 63, 94, 0.4);
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
+      --bg: #fbf8f2;
+      --card-bg: #ffffff;
+      --pine: #182f28;
+      --text-muted: #5e6f66;
+      --gold: #b88d43;
+      --gold-light: #eedebc;
+      --gold-border: rgba(184, 141, 67, 0.45);
+      --groom-green: #17332c;
+      --bride-rose: #7d2a3e;
+      --shadow-mobile: 0 4px 20px rgba(24, 47, 40, 0.08);
     }
     * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
     body {
-      background: #090c12;
-      color: var(--text);
+      background: var(--bg);
+      color: var(--pine);
       font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
       min-height: 100vh;
       min-height: -webkit-fill-available;
       display: flex;
       flex-direction: column;
-      overflow-x: hidden;
       user-select: none;
     }
 
-    /* Connection Status Toast */
-    #connectionBanner {
+    #reconnectBanner {
       display: none;
-      background: #eab308;
-      color: #000;
-      text-align: center;
-      padding: 0.4rem;
-      font-size: 0.85rem;
+      background: #eedebc;
+      color: var(--pine);
+      font-size: 0.8rem;
       font-weight: 700;
-      position: sticky;
-      top: 0;
-      z-index: 100;
+      text-align: center;
+      padding: 0.35rem;
+      border-bottom: 1px solid var(--gold);
     }
 
-    /* Header */
+    /* HEADER */
     header {
-      padding: 0.9rem 1.2rem;
+      padding: 0.85rem 1.2rem;
+      background: rgba(251, 248, 242, 0.95);
+      border-bottom: 1px solid var(--gold-border);
       display: flex;
       justify-content: space-between;
       align-items: center;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-      background: rgba(14, 19, 31, 0.7);
-      backdrop-filter: blur(10px);
+      backdrop-filter: blur(8px);
     }
-    .header-title {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 1.45rem;
-      font-weight: 700;
-      color: var(--gold-light);
+    .header-logo {
+      display: flex;
+      flex-direction: column;
     }
-    .player-chip {
-      background: rgba(255, 255, 255, 0.08);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: 999px;
-      padding: 0.35rem 0.8rem;
-      font-size: 0.85rem;
+    .header-super {
+      font-family: 'Cinzel', serif;
+      font-size: 0.6rem;
+      letter-spacing: 2px;
+      color: var(--gold);
+      text-transform: uppercase;
+    }
+    .header-names {
+      font-family: 'Playfair Display', serif;
+      font-size: 1.25rem;
+      font-weight: 600;
+      font-style: italic;
+      color: var(--pine);
+    }
+    .header-badge {
+      background: #fff;
+      border: 1px solid var(--gold-border);
+      padding: 0.3rem 0.75rem;
+      border-radius: 3px;
+      font-size: 0.82rem;
       font-weight: 700;
       display: flex;
       align-items: center;
       gap: 0.4rem;
     }
-    .player-chip .score { color: var(--gold); }
+    .header-badge .score { color: var(--gold); }
 
-    /* Screen Container */
+    /* SCREENS */
     main {
       flex: 1;
       display: flex;
@@ -1784,325 +1816,315 @@ const PLAYER_HTML = `<!DOCTYPE html>
       padding: 1.2rem;
       position: relative;
     }
-
     .screen {
       display: none;
       flex-direction: column;
       flex: 1;
       width: 100%;
       height: 100%;
-      animation: fadeIn 0.3s ease;
+      animation: fadeIn 0.25s ease;
     }
     .screen.active { display: flex; }
-    @keyframes fadeIn { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
-    /* 1. JOIN SCREEN */
-    .join-container {
-      margin: auto 0;
-      background: var(--card);
-      border: 1px solid rgba(212, 175, 55, 0.25);
-      border-radius: 24px;
-      padding: 2rem 1.5rem;
+    /* STATIONERY CARD */
+    .mobile-stationery-card {
+      background: #fff;
+      border: 1px solid var(--gold-border);
+      box-shadow: inset 0 0 0 2px #fbf8f2, inset 0 0 0 3px var(--gold-border), var(--shadow-mobile);
+      border-radius: 4px;
+      padding: 1.8rem 1.4rem;
       text-align: center;
-      box-shadow: 0 15px 40px rgba(0,0,0,0.6);
     }
-    .join-title {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 2.3rem;
-      color: var(--gold-light);
+
+    .card-stars {
+      color: var(--gold);
+      font-size: 0.75rem;
+      letter-spacing: 4px;
       margin-bottom: 0.5rem;
     }
-    .join-desc {
+
+    /* 1. JOIN SCREEN */
+    .join-container { margin: auto 0; }
+    .join-title {
+      font-family: 'Playfair Display', serif;
+      font-size: 2.1rem;
+      color: var(--pine);
+      font-style: italic;
+      line-height: 1.2;
+      margin-bottom: 0.5rem;
+    }
+    .join-subtitle {
       color: var(--text-muted);
-      font-size: 0.95rem;
+      font-size: 0.92rem;
       margin-bottom: 1.8rem;
     }
     .name-input {
       width: 100%;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.2);
-      border-radius: 14px;
-      padding: 1rem;
-      font-size: 1.25rem;
+      background: #fcfaf6;
+      border: 1px solid var(--gold-border);
+      border-radius: 3px;
+      padding: 0.95rem;
+      font-size: 1.2rem;
       font-weight: 700;
-      color: #fff;
+      color: var(--pine);
       text-align: center;
       outline: none;
       margin-bottom: 1.2rem;
-      transition: border-color 0.2s;
     }
-    .name-input:focus { border-color: var(--gold); }
-    .btn-join {
+    .name-input:focus { border-color: var(--gold); background: #fff; }
+    .btn-gold-mobile {
       width: 100%;
-      background: linear-gradient(135deg, #d4af37 0%, #a67c00 100%);
-      color: #0b0f19;
-      border: none;
-      border-radius: 14px;
-      padding: 1.05rem;
-      font-size: 1.15rem;
-      font-weight: 800;
+      background: var(--gold);
+      color: #fff;
+      border: 1px solid #9c732e;
+      padding: 1rem;
+      font-family: 'Cinzel', serif;
+      font-size: 1rem;
+      letter-spacing: 1.5px;
+      border-radius: 3px;
       cursor: pointer;
-      box-shadow: 0 8px 25px rgba(212, 175, 55, 0.3);
+      font-weight: 700;
     }
 
-    /* 2. LOBBY WAITING SCREEN */
+    /* 2. LOBBY SCREEN */
     .waiting-box {
-      margin: auto;
-      text-align: center;
+      margin: auto 0;
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 1.2rem;
-    }
-    .pulse-rings {
-      font-size: 4rem;
-      animation: bounce 1.6s infinite ease-in-out;
-    }
-    @keyframes bounce { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-12px); } }
-    .waiting-box h2 {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 2.2rem;
-      color: var(--gold-light);
-    }
-    .waiting-box p {
-      color: var(--text-muted);
-      max-width: 280px;
-      font-size: 1rem;
-      line-height: 1.4;
+      gap: 1rem;
     }
 
-    /* 3. QUESTION SCREEN & VOTING BUTTONS */
-    .question-info {
+    /* 3. QUESTION SCREEN & TWO LARGE VOTE BUTTONS */
+    .q-screen-header {
       text-align: center;
-      margin-bottom: 1.2rem;
-    }
-    .q-meta {
-      font-size: 0.85rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      color: var(--gold);
-      margin-bottom: 0.4rem;
-    }
-    .q-title {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 1.85rem;
-      line-height: 1.25;
-      color: #fff;
-    }
-
-    .vote-buttons-grid {
-      display: flex;
-      flex-direction: column;
-      gap: 1.1rem;
-      flex: 1;
-      justify-content: center;
       margin-bottom: 1rem;
     }
+    .q-meta-tag {
+      font-family: 'Cinzel', serif;
+      font-size: 0.75rem;
+      letter-spacing: 2px;
+      color: var(--gold);
+      text-transform: uppercase;
+      margin-bottom: 0.3rem;
+    }
+    .q-statement {
+      font-family: 'Playfair Display', serif;
+      font-size: 1.65rem;
+      line-height: 1.3;
+      color: var(--pine);
+      font-style: italic;
+    }
 
-    .btn-vote {
+    .vote-options-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
       flex: 1;
-      border-radius: 20px;
-      border: 2px solid transparent;
+      justify-content: center;
+      margin-bottom: 0.8rem;
+    }
+
+    .btn-option {
+      flex: 1;
+      border-radius: 4px;
+      border: 1px solid var(--gold-border);
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
       cursor: pointer;
-      position: relative;
       touch-action: manipulation;
-      transition: transform 0.12s ease, opacity 0.2s ease, border-color 0.2s;
+      transition: transform 0.1s ease, opacity 0.2s, box-shadow 0.2s;
+      position: relative;
     }
-    .btn-vote:active {
-      transform: scale(0.96);
-    }
-    .btn-vote.groom {
-      background: linear-gradient(145deg, #1d4ed8 0%, #1e3a8a 100%);
-      box-shadow: 0 10px 30px var(--groom-glow);
-    }
-    .btn-vote.bride {
-      background: linear-gradient(145deg, #e11d48 0%, #9f1239 100%);
-      box-shadow: 0 10px 30px var(--bride-glow);
-    }
-    .btn-vote .role-tag {
-      font-size: 0.95rem;
-      font-weight: 600;
-      letter-spacing: 1px;
-      text-transform: uppercase;
-      opacity: 0.85;
-      margin-bottom: 0.3rem;
-    }
-    .btn-vote .name-tag {
-      font-size: 2.4rem;
-      font-weight: 800;
+    .btn-option:active { transform: scale(0.97); }
+
+    /* Groom Option - Deep Forest Green Tuxedo */
+    .btn-option.groom {
+      background: var(--groom-green);
       color: #fff;
+      box-shadow: inset 0 0 0 2px #183d34, 0 6px 18px rgba(23, 51, 44, 0.25);
+    }
+    /* Bride Option - Luxury Rose Velvet */
+    .btn-option.bride {
+      background: var(--bride-rose);
+      color: #fff;
+      box-shadow: inset 0 0 0 2px #8d3146, 0 6px 18px rgba(125, 42, 62, 0.25);
     }
 
-    /* Selected state */
-    .btn-vote.selected {
-      border-color: #fff;
-      box-shadow: 0 0 35px #fff;
+    .btn-option .role-sub {
+      font-family: 'Cinzel', serif;
+      font-size: 0.8rem;
+      letter-spacing: 2px;
+      color: #eedebc;
+      text-transform: uppercase;
+      margin-bottom: 0.25rem;
     }
-    .btn-vote.dimmed {
-      opacity: 0.35;
-      filter: grayscale(40%);
-    }
-
-    .vote-status-banner {
-      display: none;
-      text-align: center;
-      padding: 0.8rem;
-      background: rgba(16, 185, 129, 0.15);
-      border: 1px solid #10b981;
-      border-radius: 12px;
-      color: #34d399;
+    .btn-option .name-main {
+      font-family: 'Playfair Display', serif;
+      font-size: 2.3rem;
       font-weight: 700;
-      font-size: 0.95rem;
-      margin-top: 0.5rem;
+      color: #fff;
+      letter-spacing: 0.5px;
+    }
+
+    .btn-option.is-selected {
+      border: 2px solid #fff;
+      box-shadow: 0 0 0 3px var(--gold), 0 8px 25px rgba(0,0,0,0.3);
+    }
+    .btn-option.is-dimmed {
+      opacity: 0.35;
+      filter: grayscale(30%);
+    }
+
+    .vote-confirmation-strip {
+      display: none;
+      background: #f4ecdc;
+      border: 1px solid var(--gold);
+      padding: 0.8rem;
+      border-radius: 3px;
+      text-align: center;
+      font-size: 0.88rem;
+      font-weight: 700;
+      color: var(--pine);
     }
 
     /* 4. REVEAL / RESULT SCREEN */
-    .result-card {
-      margin: auto 0;
-      background: var(--card);
-      border-radius: 24px;
-      padding: 2.2rem 1.5rem;
-      text-align: center;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 1.2rem;
-      border: 1px solid rgba(255,255,255,0.1);
+    .result-card-inner { margin: auto 0; }
+    .result-icon { font-size: 3.5rem; margin-bottom: 0.5rem; }
+    .result-outcome-title {
+      font-family: 'Playfair Display', serif;
+      font-size: 2.2rem;
+      color: var(--pine);
+      font-style: italic;
+      margin-bottom: 0.3rem;
     }
-    .result-icon { font-size: 4rem; }
-    .result-title {
-      font-family: 'Cormorant Garamond', serif;
-      font-size: 2.4rem;
-      line-height: 1.1;
-    }
-    .result-points {
-      font-size: 1.3rem;
+    .result-points-pill {
+      font-size: 1.25rem;
       font-weight: 800;
       color: var(--gold);
+      margin-bottom: 1rem;
     }
-    .result-answer-info {
-      font-size: 1rem;
-      color: var(--text-muted);
-      line-height: 1.4;
+    .official-ans-label {
+      background: #fbf8f2;
+      border: 1px solid var(--gold-subtle);
+      padding: 0.75rem;
+      border-radius: 3px;
+      font-size: 0.95rem;
+      color: var(--pine);
+      margin-bottom: 1.2rem;
     }
-    .score-summary-pill {
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: 14px;
-      padding: 0.8rem 1.5rem;
+    .rank-score-row {
       display: flex;
       justify-content: space-between;
-      width: 100%;
-      font-size: 1.1rem;
+      padding: 0.75rem 1rem;
+      background: #fcfaf6;
+      border: 1px solid var(--gold-subtle);
+      border-radius: 3px;
+      margin-top: 0.5rem;
+      font-size: 0.95rem;
       font-weight: 700;
     }
 
-    /* 5. FINAL / PODIUM SCREEN */
-    .final-card {
-      margin: auto 0;
-      background: var(--card);
-      border: 1px solid var(--gold);
-      border-radius: 24px;
-      padding: 2.5rem 1.5rem;
-      text-align: center;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 1.2rem;
-      box-shadow: 0 0 40px rgba(212, 175, 55, 0.2);
-    }
+    /* 5. FINAL SCREEN */
+    .final-card-inner { margin: auto 0; }
   </style>
 </head>
 <body>
-  <div id="connectionBanner">Reconnecting to quiz...</div>
+  <div id="reconnectBanner">Reconnecting to game...</div>
 
-  <header id="appHeader" style="display: none;">
-    <div class="header-title">💍 Aumre &amp; Joudy</div>
-    <div class="player-chip">
-      <span id="headerNick">Guest</span>
-      <span class="score" id="headerScore">0 pts</span>
+  <header id="mobileHeader" style="display: none;">
+    <div class="header-logo">
+      <span class="header-super">The Wedding Of</span>
+      <span class="header-names">Aumre &amp; Joudy</span>
+    </div>
+    <div class="header-badge">
+      <span id="playerNick">Guest</span>
+      <span class="score" id="playerScore">0 pts</span>
     </div>
   </header>
 
   <main>
     <!-- 1. JOIN SCREEN -->
     <div id="screenJoin" class="screen active">
-      <div class="join-container">
-        <h1 class="join-title">Aumre &amp; Joudy's Wedding Quiz</h1>
-        <p class="join-desc">Enter your nickname to join the live game!</p>
+      <div class="mobile-stationery-card join-container">
+        <div class="card-stars">◆ ✦ ◆</div>
+        <h1 class="join-title">Aumre &amp; Joudy</h1>
+        <p class="join-subtitle">Enter your name to join tonight's wedding quiz!</p>
         <input type="text" id="nicknameInput" class="name-input" placeholder="Your Name" maxlength="16" autocomplete="off" autocapitalize="words">
-        <button class="btn-join" onclick="joinGame()">Join Game</button>
+        <button class="btn-gold-mobile" onclick="joinGame()">Join Game &rarr;</button>
       </div>
     </div>
 
     <!-- 2. LOBBY WAITING SCREEN -->
     <div id="screenLobby" class="screen">
-      <div class="waiting-box">
-        <div class="pulse-rings">💍✨</div>
-        <h2>You're In!</h2>
-        <p>Waiting for the MC to start the quiz on the big screen...</p>
+      <div class="mobile-stationery-card waiting-box">
+        <div class="card-stars">◆ ✦ ◆</div>
+        <div style="font-size: 3rem;">💍✨</div>
+        <h2 style="font-family: 'Playfair Display', serif; font-size: 2rem; font-style: italic; color: var(--pine);">You're In!</h2>
+        <p style="color: var(--text-muted); font-size: 0.95rem; line-height: 1.5;">Waiting for the MC to start the quiz on the big screen...</p>
       </div>
     </div>
 
     <!-- 3. QUESTION SCREEN -->
     <div id="screenQuestion" class="screen">
-      <div class="question-info">
-        <div class="q-meta" id="playerQMeta">Question 1 of 20</div>
-        <h2 class="q-title" id="playerQTitle">Who is more likely to...?</h2>
+      <div class="q-screen-header">
+        <div class="q-meta-tag" id="mobileQBadge">Question 1 of 20</div>
+        <h2 class="q-statement" id="mobileQText">Who is more likely to...?</h2>
       </div>
 
-      <div class="vote-buttons-grid">
-        <button class="btn-vote groom" id="btnAumre" onclick="submitVote('Aumre')">
-          <span class="role-tag">The Groom 🤵</span>
-          <span class="name-tag">AUMRE</span>
+      <div class="vote-options-stack">
+        <!-- Aumre -->
+        <button class="btn-option groom" id="optAumre" onclick="submitAnswer('Aumre')">
+          <span class="role-sub">The Groom 🤵</span>
+          <span class="name-main">AUMRE</span>
         </button>
-
-        <button class="btn-vote bride" id="btnJoudy" onclick="submitVote('Joudy')">
-          <span class="role-tag">The Bride 👰</span>
-          <span class="name-tag">JOUDY</span>
+        <!-- Joudy -->
+        <button class="btn-option bride" id="optJoudy" onclick="submitAnswer('Joudy')">
+          <span class="role-sub">The Bride 👰</span>
+          <span class="name-main">JOUDY</span>
         </button>
       </div>
 
-      <div class="vote-status-banner" id="voteSubmittedBanner">
-        ✓ Vote Registered: <span id="votedChoiceName"></span>! Waiting for reveal...
+      <div class="vote-confirmation-strip" id="voteSubmittedBar">
+        ✓ Answer Locked: <span id="votedNameSpan"></span>! Awaiting official answer...
       </div>
     </div>
 
-    <!-- 4. REVEAL / RESULT SCREEN -->
+    <!-- 4. REVEAL RESULT SCREEN -->
     <div id="screenResult" class="screen">
-      <div class="result-card">
+      <div class="mobile-stationery-card result-card-inner">
+        <div class="card-stars">◆ ✦ ◆</div>
         <div class="result-icon" id="resIcon">🎉</div>
-        <h2 class="result-title" id="resTitle">You Got It Right!</h2>
-        <div class="result-points" id="resPoints">+920 pts</div>
-        <p class="result-answer-info" id="resInfo">The correct answer was Joudy.</p>
-        <div class="score-summary-pill">
-          <span>Your Total Score</span>
+        <h2 class="result-outcome-title" id="resTitle">Splendid!</h2>
+        <div class="result-points-pill" id="resPoints">+950 pts</div>
+        <div class="official-ans-label" id="resOfficialAnswerText">Official Answer: Joudy</div>
+        <div class="rank-score-row">
+          <span>Total Score</span>
           <span id="resTotalScore" style="color: var(--gold);">0 pts</span>
         </div>
-        <div class="score-summary-pill">
-          <span>Current Rank</span>
-          <span id="resRank">#1</span>
+        <div class="rank-score-row">
+          <span>Current Standing</span>
+          <span id="resRank">#1 of 0</span>
         </div>
       </div>
     </div>
 
     <!-- 5. FINAL SCREEN -->
     <div id="screenFinal" class="screen">
-      <div class="final-card">
-        <div style="font-size: 3.5rem;">🏆🥂</div>
-        <h2 style="font-family: 'Cormorant Garamond', serif; font-size: 2.2rem; color: var(--gold-light);">Quiz Completed!</h2>
-        <p style="color: var(--text-muted);">Thank you for celebrating with Aumre &amp; Joudy!</p>
-        <div class="score-summary-pill">
+      <div class="mobile-stationery-card final-card-inner">
+        <div class="card-stars">◆ ✦ ◆</div>
+        <div style="font-size: 3rem;">🏆🥂</div>
+        <h2 style="font-family: 'Playfair Display', serif; font-size: 2.2rem; font-style: italic; color: var(--pine);">Quiz Completed!</h2>
+        <p style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 1.2rem;">Thank you for being here with us tonight!</p>
+        <div class="rank-score-row">
           <span>Final Score</span>
           <span id="finalScore" style="color: var(--gold);">0 pts</span>
         </div>
-        <div class="score-summary-pill">
-          <span>Final Rank</span>
+        <div class="rank-score-row">
+          <span>Final Standing</span>
           <span id="finalRank">#1</span>
         </div>
       </div>
@@ -2122,92 +2144,80 @@ const PLAYER_HTML = `<!DOCTYPE html>
     }
 
     function initHeader(nick, score) {
-      document.getElementById('appHeader').style.display = 'flex';
-      document.getElementById('headerNick').textContent = nick;
-      document.getElementById('headerScore').textContent = (score || 0) + ' pts';
+      document.getElementById('mobileHeader').style.display = 'flex';
+      document.getElementById('playerNick').textContent = nick;
+      document.getElementById('playerScore').textContent = (score || 0) + ' pts';
     }
 
-    // --- RECONNECT & WEBSOCKET ENGINE ---
     function connectWS() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       ws = new WebSocket(protocol + '//' + window.location.host);
 
       ws.onopen = () => {
-        document.getElementById('connectionBanner').style.display = 'none';
-        // Auto rejoin if returning
+        document.getElementById('reconnectBanner').style.display = 'none';
         if (playerId) {
-          ws.send(JSON.stringify({
-            type: 'PLAYER_REJOIN',
-            playerId,
-            nickname
-          }));
+          ws.send(JSON.stringify({ type: 'PLAYER_REJOIN', playerId, nickname }));
         }
       };
 
       ws.onmessage = (event) => {
         try {
-          const msg = JSON.parse(event.data);
-          handleServerMessage(msg);
+          handleServerMessage(JSON.parse(event.data));
         } catch(e) {
           console.error(e);
         }
       };
 
       ws.onclose = () => {
-        document.getElementById('connectionBanner').style.display = 'block';
-        setTimeout(connectWS, 1500); // Silent robust reconnect
+        document.getElementById('reconnectBanner').style.display = 'block';
+        setTimeout(connectWS, 1500);
       };
     }
 
     function joinGame() {
       const input = document.getElementById('nicknameInput');
       const name = input.value.trim();
-      if (!name) {
-        input.focus();
-        return;
-      }
+      if (!name) { input.focus(); return; }
       nickname = name;
       localStorage.setItem('wedding_nickname', name);
 
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'PLAYER_JOIN',
-          playerId,
-          nickname
-        }));
+        ws.send(JSON.stringify({ type: 'PLAYER_JOIN', playerId, nickname }));
       }
     }
 
-    function submitVote(choice) {
+    function submitAnswer(choice) {
       if (hasAnsweredCurrent) return;
       hasAnsweredCurrent = true;
 
-      // Haptic feedback
       if (navigator.vibrate) navigator.vibrate(40);
 
-      // UI locking
-      const btnA = document.getElementById('btnAumre');
-      const btnJ = document.getElementById('btnJoudy');
+      const btnA = document.getElementById('optAumre');
+      const btnJ = document.getElementById('optJoudy');
       if (choice === 'Aumre') {
-        btnA.classList.add('selected');
-        btnJ.classList.add('dimmed');
+        btnA.classList.add('is-selected');
+        btnJ.classList.add('is-dimmed');
       } else {
-        btnJ.classList.add('selected');
-        btnA.classList.add('dimmed');
+        btnJ.classList.add('is-selected');
+        btnA.classList.add('is-dimmed');
       }
 
-      document.getElementById('votedChoiceName').textContent = choice;
-      document.getElementById('voteSubmittedBanner').style.display = 'block';
+      document.getElementById('votedNameSpan').textContent = choice;
+      document.getElementById('voteSubmittedBar').style.display = 'block';
 
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'SUBMIT_ANSWER',
-          answer: choice
-        }));
+        ws.send(JSON.stringify({ type: 'SUBMIT_ANSWER', answer: choice }));
       }
     }
 
     function handleServerMessage(msg) {
+      if (msg.type === 'KICKED') {
+        localStorage.removeItem('wedding_player_id');
+        alert('You have been removed from the quiz lobby.');
+        location.reload();
+        return;
+      }
+
       if (msg.type === 'JOIN_CONFIRMED' || msg.type === 'REJOIN_CONFIRMED') {
         playerId = msg.playerId;
         nickname = msg.nickname;
@@ -2235,57 +2245,56 @@ const PLAYER_HTML = `<!DOCTYPE html>
         const icon = document.getElementById('resIcon');
         const title = document.getElementById('resTitle');
         const pts = document.getElementById('resPoints');
-        const info = document.getElementById('resInfo');
+        const offAns = document.getElementById('resOfficialAnswerText');
 
         if (msg.isCorrect) {
           icon.textContent = '🎉';
-          title.textContent = 'Correct!';
-          title.style.color = '#34d399';
+          title.textContent = 'Splendid!';
+          title.style.color = '#182f28';
           pts.textContent = '+' + msg.pointsEarned.toLocaleString() + ' pts';
         } else {
           icon.textContent = '😅';
           title.textContent = 'Not quite!';
-          title.style.color = '#fb7185';
+          title.style.color = '#7d2a3e';
           pts.textContent = '+0 pts';
         }
 
-        info.textContent = 'Verified answer was ' + msg.correctAnswer + '.';
+        offAns.textContent = 'Official Answer: ' + msg.correctAnswer;
         document.getElementById('resTotalScore').textContent = msg.newScore.toLocaleString() + ' pts';
         document.getElementById('resRank').textContent = '#' + msg.rank + ' of ' + msg.totalPlayers;
         return;
       }
 
       if (msg.type === 'PLAYER_STATE_UPDATE') {
-        if (!playerId) return; // not joined yet
+        if (!playerId) return;
         initHeader(nickname, msg.score);
 
         if (msg.status === 'LOBBY') {
           switchScreen('screenLobby');
         } else if (msg.status === 'QUESTION') {
           switchScreen('screenQuestion');
-          document.getElementById('playerQMeta').textContent = 'Question ' + (msg.questionIndex + 1) + ' of ' + msg.totalQuestions;
-          document.getElementById('playerQTitle').textContent = msg.question;
+          document.getElementById('mobileQBadge').textContent = 'Question ' + (msg.questionIndex + 1) + ' of ' + msg.totalQuestions;
+          document.getElementById('mobileQText').textContent = msg.question;
 
-          // Check if already answered
-          const btnA = document.getElementById('btnAumre');
-          const btnJ = document.getElementById('btnJoudy');
-          const banner = document.getElementById('voteSubmittedBanner');
+          const btnA = document.getElementById('optAumre');
+          const btnJ = document.getElementById('optJoudy');
+          const banner = document.getElementById('voteSubmittedBar');
 
           if (msg.myAnswer) {
             hasAnsweredCurrent = true;
             if (msg.myAnswer === 'Aumre') {
-              btnA.classList.add('selected');
-              btnJ.classList.add('dimmed');
+              btnA.classList.add('is-selected');
+              btnJ.classList.add('is-dimmed');
             } else {
-              btnJ.classList.add('selected');
-              btnA.classList.add('dimmed');
+              btnJ.classList.add('is-selected');
+              btnA.classList.add('is-dimmed');
             }
-            document.getElementById('votedChoiceName').textContent = msg.myAnswer;
+            document.getElementById('votedNameSpan').textContent = msg.myAnswer;
             banner.style.display = 'block';
           } else {
             hasAnsweredCurrent = false;
-            btnA.classList.remove('selected', 'dimmed');
-            btnJ.classList.remove('selected', 'dimmed');
+            btnA.classList.remove('is-selected', 'is-dimmed');
+            btnJ.classList.remove('is-selected', 'is-dimmed');
             banner.style.display = 'none';
           }
         } else if (msg.status === 'FINAL') {
@@ -2296,7 +2305,6 @@ const PLAYER_HTML = `<!DOCTYPE html>
       }
     }
 
-    // Auto-focus input on open
     window.addEventListener('DOMContentLoaded', () => {
       if (nickname && !playerId) {
         document.getElementById('nicknameInput').value = nickname;
