@@ -1,5 +1,7 @@
 # 💍 Aumre & Joudy Wedding Quiz
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Ibrahim-Atiq/aumre-wedding-quiz)
+
 An all-in-one, real-time multiplayer wedding trivia game built specifically for **Aumre & Joudy's Wedding**. Supports 50–100+ guests simultaneously on mobile devices, optimized for free-tier Render deployment.
 
 ---
