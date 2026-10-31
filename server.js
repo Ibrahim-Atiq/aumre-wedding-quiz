@@ -129,6 +129,7 @@ function launchQuestion(qIndex) {
 function launchReveal() {
   stopTimer();
   gameState.status = 'REVEAL';
+  gameState.isPaused = false;
   gameState.pausedAt = null;
 
   const currentQ = QUESTIONS[gameState.questionIndex];
@@ -169,6 +170,8 @@ function launchReveal() {
 function launchLeaderboard() {
   stopTimer();
   gameState.status = 'LEADERBOARD';
+  gameState.isPaused = false;
+  gameState.pausedAt = null;
   broadcastGameState();
 
   // 7s leaderboard timer -> auto transitions to NEXT QUESTION or FINAL
@@ -184,6 +187,8 @@ function launchLeaderboard() {
 function launchFinal() {
   stopTimer();
   gameState.status = 'FINAL';
+  gameState.isPaused = false;
+  gameState.pausedAt = null;
   broadcastGameState();
 }
 
@@ -372,6 +377,9 @@ app.get('/health', (req, res) => {
 // --- HTTP & WEBSOCKET SERVER ---
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
+wss.on('error', (err) => {
+  console.error('WebSocketServer error:', err && err.message);
+});
 
 wss.on('connection', (ws) => {
   ws.isAlive = true;
@@ -412,13 +420,14 @@ wss.on('connection', (ws) => {
 
         if (pId && players.has(pId)) {
           const existing = players.get(pId);
-          if (existing.ws && existing.ws !== ws) {
-            try { existing.ws.terminate(); } catch (e) {}
-          }
+          const oldWs = existing.ws;
           existing.ws = ws;
           existing.connected = true;
           existing.nickname = nickname || existing.nickname;
           attachedPlayerId = pId;
+          if (oldWs && oldWs !== ws) {
+            try { oldWs.terminate(); } catch (e) {}
+          }
         } else {
           pId = crypto.randomUUID();
           attachedPlayerId = pId;
@@ -449,13 +458,14 @@ wss.on('connection', (ws) => {
         const pId = msg.playerId;
         if (pId && players.has(pId)) {
           const p = players.get(pId);
-          if (p.ws && p.ws !== ws) {
-            try { p.ws.terminate(); } catch (e) {}
-          }
+          const oldWs = p.ws;
           p.ws = ws;
           p.connected = true;
           attachedPlayerId = pId;
           clientType = 'PLAYER';
+          if (oldWs && oldWs !== ws) {
+            try { oldWs.terminate(); } catch (e) {}
+          }
 
           ws.send(JSON.stringify({
             type: 'REJOIN_CONFIRMED',
@@ -473,7 +483,13 @@ wss.on('connection', (ws) => {
 
       if (msg.type === 'SUBMIT_ANSWER' && attachedPlayerId) {
         if (gameState.status !== 'QUESTION') return;
-        if (gameState.isPaused) return; // Reject votes while paused
+        if (gameState.isPaused) {
+          ws.send(JSON.stringify({
+            type: 'ANSWER_REJECTED_PAUSED',
+            message: 'Game is currently paused by the host'
+          }));
+          return;
+        }
         if (gameState.answers[attachedPlayerId]) return;
 
         const chosen = msg.answer;
@@ -516,11 +532,12 @@ wss.on('connection', (ws) => {
 
         // Quorum-based auto-reveal: only if all registered answered, or >= 75% registered answered AND all connected answered
         const totalReg = players.size;
-        const activeCount = Array.from(players.values()).filter(pl => pl.connected).length;
+        const connectedPlayers = Array.from(players.values()).filter(pl => pl.connected);
         const ansCount = Object.keys(gameState.answers).length;
 
         const allRegisteredAnswered = totalReg > 0 && ansCount >= totalReg;
-        const quorumMet = totalReg > 0 && (ansCount / totalReg >= 0.75) && (ansCount >= activeCount);
+        const allConnectedAnswered = connectedPlayers.length > 0 && connectedPlayers.every(pl => !!gameState.answers[pl.id]);
+        const quorumMet = totalReg > 0 && (ansCount / totalReg >= 0.75) && allConnectedAnswered;
 
         if ((allRegisteredAnswered || quorumMet) && gameState.autoFlow && !gameState.isPaused) {
           launchReveal();
@@ -571,6 +588,10 @@ function handleHostAction(msg) {
       gameState.status = 'QUESTION';
       gameState.isPaused = true;
       gameState.pausedAt = Date.now();
+      if (gameState.timeRemaining <= 0) {
+        gameState.timeRemaining = QUESTION_TIMER_SECONDS;
+        gameState.maxTime = QUESTION_TIMER_SECONDS;
+      }
       broadcastGameState();
       break;
 
@@ -590,7 +611,9 @@ function handleHostAction(msg) {
       break;
 
     case 'PREV_QUESTION':
-      if (gameState.questionIndex > 0) {
+      if (gameState.status === 'FINAL') {
+        launchQuestion(QUESTIONS.length - 1);
+      } else if (gameState.questionIndex > 0) {
         launchQuestion(gameState.questionIndex - 1);
       }
       break;
@@ -605,14 +628,27 @@ function handleHostAction(msg) {
           gameState.totalPausedDuration = (gameState.totalPausedDuration || 0) + (Date.now() - gameState.pausedAt);
           gameState.pausedAt = null;
         }
+        if (!timerInterval) {
+          if (gameState.status === 'QUESTION') {
+            const rem = gameState.timeRemaining > 0 ? gameState.timeRemaining : QUESTION_TIMER_SECONDS;
+            startPhaseTimer(rem, () => { launchReveal(); });
+          } else if (gameState.status === 'REVEAL') {
+            const rem = gameState.timeRemaining > 0 ? gameState.timeRemaining : REVEAL_TIMER_SECONDS;
+            startPhaseTimer(rem, () => { launchLeaderboard(); });
+          } else if (gameState.status === 'LEADERBOARD') {
+            const rem = gameState.timeRemaining > 0 ? gameState.timeRemaining : LEADERBOARD_TIMER_SECONDS;
+            startPhaseTimer(rem, () => {
+              if (gameState.questionIndex + 1 < QUESTIONS.length) {
+                launchQuestion(gameState.questionIndex + 1);
+              } else {
+                launchFinal();
+              }
+            });
+          }
+        }
       }
       broadcastTimerTick();
-      const hostPayload = JSON.stringify(getHostStatePayload());
-      hostSockets.forEach(h => {
-        if (h.readyState === WebSocket.OPEN) {
-          try { h.send(hostPayload); } catch (e) {}
-        }
-      });
+      broadcastGameState();
       break;
 
     case 'RESET_GAME':
@@ -1304,8 +1340,10 @@ const HOST_HTML = `<!DOCTYPE html>
       <div class="card-ornament">◆ ✦ ◆</div>
       <h2 style="font-family: 'Playfair Display', serif; font-size: 2.2rem; margin-bottom: 0.5rem; font-style: italic;">Host Access</h2>
       <p style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 1.5rem;">Enter Host PIN to manage the wedding quiz</p>
-      <input type="password" id="pinInput" style="width: 100%; border: 1px solid var(--gold-border); padding: 0.8rem; font-size: 1.6rem; text-align: center; letter-spacing: 5px; outline: none; margin-bottom: 1.5rem;" placeholder="••••" autofocus>
-      <button class="btn-gold-primary" style="width: 100%;" onclick="submitHostPin()">Unlock Host</button>
+      <form onsubmit="event.preventDefault(); submitHostPin();">
+        <input type="password" id="pinInput" style="width: 100%; border: 1px solid var(--gold-border); padding: 0.8rem; font-size: 1.6rem; text-align: center; letter-spacing: 5px; outline: none; margin-bottom: 1.5rem;" placeholder="••••" autofocus>
+        <button type="submit" class="btn-gold-primary" style="width: 100%;">Unlock Host</button>
+      </form>
       <div id="pinError" style="color: #b91c1c; font-size: 0.9rem; font-weight: 600; margin-top: 1rem; display: none;">Invalid PIN</div>
     </div>
   </div>
@@ -1802,22 +1840,32 @@ const HOST_HTML = `<!DOCTYPE html>
     }
 
     // Keyboard & Presenter Clicker Remote:
-    // Spacebar / ArrowRight / PageDown: Advance game stages
-    // ArrowLeft / PageUp: Previous question
+    // Spacebar / ArrowRight / PageDown / ArrowDown: Advance game stages
+    // ArrowLeft / PageUp / ArrowUp: Previous question
     // 'P': Pause / Resume
     // 'F': Fullscreen
     window.addEventListener('keydown', (e) => {
       if (e.target && e.target.tagName === 'INPUT') return;
-      if (e.code === 'Space' || e.code === 'ArrowRight' || e.code === 'PageDown') {
+      const modal = document.getElementById('pinModal');
+      if (modal && modal.style.display !== 'none') return;
+
+      const isNext = e.code === 'Space' || e.code === 'ArrowRight' || e.code === 'PageDown' || e.code === 'ArrowDown' ||
+                     e.key === ' ' || e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === 'ArrowDown';
+      const isPrev = e.code === 'ArrowLeft' || e.code === 'PageUp' || e.code === 'ArrowUp' ||
+                     e.key === 'ArrowLeft' || e.key === 'PageUp' || e.key === 'ArrowUp';
+      const isPause = e.code === 'KeyP' || e.key === 'p' || e.key === 'P';
+      const isFull = e.code === 'KeyF' || e.key === 'f' || e.key === 'F';
+
+      if (isNext) {
         e.preventDefault();
         advanceStage();
-      } else if (e.code === 'ArrowLeft' || e.code === 'PageUp') {
+      } else if (isPrev) {
         e.preventDefault();
         hostAction('PREV_QUESTION');
-      } else if (e.code === 'KeyP') {
+      } else if (isPause) {
         e.preventDefault();
         hostAction('TOGGLE_PAUSE');
-      } else if (e.code === 'KeyF') {
+      } else if (isFull) {
         e.preventDefault();
         toggleFullscreen();
       }
@@ -1832,6 +1880,19 @@ const HOST_HTML = `<!DOCTYPE html>
         }
       });
     }
+
+    function checkHostReconnect() {
+      if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        connectWS();
+      } else if (ws.readyState === WebSocket.OPEN && currentPin) {
+        ws.send(JSON.stringify({ type: 'HOST_AUTH', pin: currentPin }));
+      }
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') checkHostReconnect();
+    });
+    window.addEventListener('focus', checkHostReconnect);
+    window.addEventListener('online', checkHostReconnect);
 
     connectWS();
   </script>
@@ -2184,8 +2245,10 @@ const PLAYER_HTML = `<!DOCTYPE html>
         <div class="card-stars">◆ ✦ ◆</div>
         <h1 class="join-title">Aumre &amp; Joudy</h1>
         <p class="join-subtitle">Enter your name to join tonight's wedding quiz!</p>
-        <input type="text" id="nicknameInput" class="name-input" placeholder="Your Name" maxlength="16" autocomplete="off" autocapitalize="words">
-        <button class="btn-gold-mobile" onclick="joinGame()">Join Game &rarr;</button>
+        <form onsubmit="event.preventDefault(); joinGame();">
+          <input type="text" id="nicknameInput" class="name-input" placeholder="Your Name" maxlength="16" autocomplete="off" autocapitalize="words">
+          <button type="submit" class="btn-gold-mobile">Join Game &rarr;</button>
+        </form>
       </div>
     </div>
 
@@ -2305,11 +2368,21 @@ const PLAYER_HTML = `<!DOCTYPE html>
       };
     }
 
+    function escapeHtml(str) {
+      return (str || '').replace(/[&<>"']/g, function(m) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[m];
+      });
+    }
+
     function checkAndReconnect() {
       if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
         connectWS();
       } else if (ws.readyState === WebSocket.OPEN && playerId) {
-        ws.send(JSON.stringify({ type: 'PLAYER_REJOIN', playerId, nickname }));
+        try {
+          ws.send(JSON.stringify({ type: 'PLAYER_REJOIN', playerId, nickname }));
+        } catch (e) {
+          connectWS();
+        }
       }
     }
 
@@ -2322,6 +2395,9 @@ const PLAYER_HTML = `<!DOCTYPE html>
     window.addEventListener('pageshow', () => {
       checkAndReconnect();
     });
+
+    window.addEventListener('focus', checkAndReconnect);
+    window.addEventListener('online', checkAndReconnect);
 
     document.addEventListener('touchstart', () => {}, { passive: true });
 
@@ -2339,9 +2415,17 @@ const PLAYER_HTML = `<!DOCTYPE html>
 
     function submitAnswer(choice) {
       if (hasAnsweredCurrent) return;
-      hasAnsweredCurrent = true;
 
-      if (navigator.vibrate) navigator.vibrate(40);
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        checkAndReconnect();
+        alert('Reconnecting to server... Please tap your answer again in a second.');
+        return;
+      }
+
+      hasAnsweredCurrent = true;
+      if (navigator.vibrate) {
+        try { navigator.vibrate(40); } catch (e) {}
+      }
 
       const btnA = document.getElementById('optAumre');
       const btnJ = document.getElementById('optJoudy');
@@ -2354,10 +2438,19 @@ const PLAYER_HTML = `<!DOCTYPE html>
       }
 
       document.getElementById('votedNameSpan').textContent = choice;
-      document.getElementById('voteSubmittedBar').style.display = 'block';
+      const bar = document.getElementById('voteSubmittedBar');
+      bar.innerHTML = '✓ Answer Locked: <span>' + escapeHtml(choice) + '</span>! Awaiting official answer...';
+      bar.style.display = 'block';
+      bar.style.background = '#f4ecdc';
 
-      if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
         ws.send(JSON.stringify({ type: 'SUBMIT_ANSWER', answer: choice }));
+      } catch (e) {
+        hasAnsweredCurrent = false;
+        btnA.classList.remove('is-selected', 'is-dimmed');
+        btnJ.classList.remove('is-selected', 'is-dimmed');
+        bar.style.display = 'none';
+        checkAndReconnect();
       }
     }
 
@@ -2380,12 +2473,35 @@ const PLAYER_HTML = `<!DOCTYPE html>
       if (msg.type === 'REJOIN_EXPIRED') {
         localStorage.removeItem('wedding_player_id');
         playerId = null;
+        if (nickname) {
+          const input = document.getElementById('nicknameInput');
+          if (input) input.value = nickname;
+        }
         switchScreen('screenJoin');
         return;
       }
 
       if (msg.type === 'ANSWER_ACCEPTED') {
         hasAnsweredCurrent = true;
+        const bar = document.getElementById('voteSubmittedBar');
+        bar.innerHTML = '✓ Answer Locked: <span>' + escapeHtml(msg.answer) + '</span>! Awaiting official answer...';
+        bar.style.display = 'block';
+        bar.style.background = '#f4ecdc';
+        return;
+      }
+
+      if (msg.type === 'ANSWER_REJECTED_PAUSED') {
+        hasAnsweredCurrent = false;
+        const btnA = document.getElementById('optAumre');
+        const btnJ = document.getElementById('optJoudy');
+        if (btnA) btnA.classList.remove('is-selected', 'is-dimmed');
+        if (btnJ) btnJ.classList.remove('is-selected', 'is-dimmed');
+        const banner = document.getElementById('voteSubmittedBar');
+        if (banner) {
+          banner.textContent = '⏸ Quiz paused by MC — tap your answer once resumed!';
+          banner.style.display = 'block';
+          banner.style.background = '#eedebc';
+        }
         return;
       }
 
@@ -2441,12 +2557,20 @@ const PLAYER_HTML = `<!DOCTYPE html>
               btnA.classList.add('is-dimmed');
             }
             document.getElementById('votedNameSpan').textContent = msg.myAnswer;
+            banner.innerHTML = '✓ Answer Locked: <span>' + escapeHtml(msg.myAnswer) + '</span>! Awaiting official answer...';
             banner.style.display = 'block';
+            banner.style.background = '#f4ecdc';
           } else {
             hasAnsweredCurrent = false;
             btnA.classList.remove('is-selected', 'is-dimmed');
             btnJ.classList.remove('is-selected', 'is-dimmed');
-            banner.style.display = 'none';
+            if (msg.isPaused) {
+              banner.textContent = '⏸ Quiz paused by MC — waiting to resume...';
+              banner.style.display = 'block';
+              banner.style.background = '#eedebc';
+            } else {
+              banner.style.display = 'none';
+            }
           }
         } else if (msg.status === 'REVEAL' || msg.status === 'LEADERBOARD') {
           if (msg.myAnswer && msg.lastRevealStats) {
@@ -2486,7 +2610,7 @@ const PLAYER_HTML = `<!DOCTYPE html>
     window.addEventListener('DOMContentLoaded', () => {
       const nameInput = document.getElementById('nicknameInput');
       if (nameInput) {
-        if (nickname && !playerId) {
+        if (nickname) {
           nameInput.value = nickname;
         }
         nameInput.addEventListener('keydown', (e) => {

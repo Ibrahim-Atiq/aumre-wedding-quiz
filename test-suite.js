@@ -142,13 +142,15 @@ async function runTests() {
     host.ws.send(JSON.stringify({ action: 'TOGGLE_PAUSE' }));
     await wait(200);
 
-    // Verify answers are rejected while paused
+    // Verify answers are rejected while paused and ANSWER_REJECTED_PAUSED is sent
     p1_ws2.messages.length = 0;
     p1_ws2.ws.send(JSON.stringify({ type: 'SUBMIT_ANSWER', answer: 'Joudy' }));
     await wait(200);
     const rejectedAnswer = p1_ws2.messages.find(m => m.type === 'ANSWER_ACCEPTED');
+    const pauseRejection = p1_ws2.messages.find(m => m.type === 'ANSWER_REJECTED_PAUSED');
     assert(!rejectedAnswer, 'Answer must be REJECTED while game is paused');
-    console.log('✓ Submitting answer while paused correctly rejected');
+    assert(pauseRejection, 'Player must receive ANSWER_REJECTED_PAUSED notification while paused');
+    console.log('✓ Submitting answer while paused correctly rejected with notification');
 
     // Wait 1.5 seconds while paused
     await wait(1500);
@@ -176,7 +178,7 @@ async function runTests() {
     console.log(`✓ Speed scoring pause offset works: points earned = ${revealMsg.pointsEarned} >= 900!`);
 
     // 6. Quorum-Based Auto-Reveal
-    console.log('\n[Test 6] Quorum-based auto-reveal');
+    console.log('\n[Test 6] Quorum-based auto-reveal (with disconnected voted player edge case)');
     // Reset game and register 4 players: Alice, Bob, Charlie, David
     host.ws.send(JSON.stringify({ action: 'RESET_GAME' }));
     await wait(200);
@@ -194,32 +196,41 @@ async function runTests() {
     pDavid.ws.send(JSON.stringify({ type: 'PLAYER_JOIN', nickname: 'David' }));
     await wait(300);
 
-    // 4 players registered. Now disconnect David.
-    pDavid.ws.close();
-    await wait(200);
-
     // Start question 0
     host.ws.send(JSON.stringify({ action: 'START_GAME' }));
     await wait(200);
 
-    // Total registered: 4. Active connected: 3 (Alice, Bob, Charlie).
-    // Have 2 players answer (Alice and Bob): 2 / 4 = 50% (< 75% quorum).
+    // Alice answers first, then disconnects!
     p1_ws2.ws.send(JSON.stringify({ type: 'SUBMIT_ANSWER', answer: 'Joudy' }));
+    await wait(100);
+    p1_ws2.ws.close(); // Alice's phone went to sleep after voting
+    await wait(200);
+
+    // Now Bob and Charlie answer (total answers = 3 / 4 = 75% quorum met).
+    // BUT David is actively connected and has NOT answered!
     pBob.ws.send(JSON.stringify({ type: 'SUBMIT_ANSWER', answer: 'Aumre' }));
-    await wait(300);
-
-    // Verify status is STILL QUESTION (did NOT auto-reveal prematurely)
-    let latestHostState = host.messages.filter(m => m.type === 'HOST_STATE_UPDATE').pop();
-    assert.strictEqual(latestHostState.status, 'QUESTION', 'Game should NOT auto-reveal when only 50% answered!');
-    console.log('✓ Quorum prevents premature auto-reveal when 2/4 (50%) answered with 1 disconnected');
-
-    // Now Charlie answers: 3 / 4 = 75% (>= 75% quorum AND 3 >= 3 active connected players)
     pCharlie.ws.send(JSON.stringify({ type: 'SUBMIT_ANSWER', answer: 'Joudy' }));
     await wait(300);
 
+    // Status MUST still be QUESTION because connected player David hasn't answered yet!
+    let latestHostState = host.messages.filter(m => m.type === 'HOST_STATE_UPDATE').pop();
+    assert.strictEqual(latestHostState.status, 'QUESTION', 'Game must NOT auto-reveal when connected player David has not answered!');
+    console.log('✓ Quorum correctly protects connected player David from being cut off');
+
+    // Now David answers -> Quorum met AND all connected answered -> Auto-reveal!
+    pDavid.ws.send(JSON.stringify({ type: 'SUBMIT_ANSWER', answer: 'Aumre' }));
+    await wait(300);
+
     latestHostState = host.messages.filter(m => m.type === 'HOST_STATE_UPDATE').pop();
-    assert.strictEqual(latestHostState.status, 'REVEAL', 'Game SHOULD auto-reveal when >= 75% quorum met and all active answered!');
-    console.log('✓ Quorum auto-reveals when 75% quorum reached and all active answered!');
+    assert.strictEqual(latestHostState.status, 'REVEAL', 'Game SHOULD auto-reveal when all connected answered and quorum met!');
+    console.log('✓ Quorum auto-reveals when all active connected players have answered');
+
+    // Reconnect Alice for subsequent tests
+    const pAliceReconnect = createClient();
+    await pAliceReconnect.openPromise;
+    const aliceOrigId = host.messages.find(m => m.type === 'HOST_STATE_UPDATE').guestList.find(g => g.nickname === 'Alice').id;
+    pAliceReconnect.ws.send(JSON.stringify({ type: 'PLAYER_REJOIN', playerId: aliceOrigId, nickname: 'Alice' }));
+    await wait(200);
 
     // 7. Reconnect during REVEAL and LEADERBOARD
     console.log('\n[Test 7] Reconnect on REVEAL and LEADERBOARD');
@@ -239,7 +250,7 @@ async function runTests() {
     console.log('✓ Reconnect on REVEAL provides lastRevealStats and answer correctly!');
 
     // 8. Host Navigation Actions
-    console.log('\n[Test 8] Host Navigation: BACK_TO_QUESTION and NEXT_QUESTION from LOBBY');
+    console.log('\n[Test 8] Host Navigation: BACK_TO_QUESTION, timer resumption, and NEXT_QUESTION from LOBBY');
     // BACK_TO_QUESTION: should set status to QUESTION, isPaused to true, and stop timer
     host.ws.send(JSON.stringify({ action: 'BACK_TO_QUESTION' }));
     await wait(200);
@@ -248,6 +259,15 @@ async function runTests() {
     assert.strictEqual(latestHostState.status, 'QUESTION', 'BACK_TO_QUESTION should return to QUESTION');
     assert.strictEqual(latestHostState.isPaused, true, 'BACK_TO_QUESTION must set isPaused = true');
     console.log('✓ BACK_TO_QUESTION correctly sets status=QUESTION and isPaused=true');
+
+    // Unpause after BACK_TO_QUESTION -> timer interval MUST resume!
+    host.messages.length = 0;
+    host.ws.send(JSON.stringify({ action: 'TOGGLE_PAUSE' }));
+    await wait(1500);
+
+    const resumedTicks = host.messages.filter(m => m.type === 'TIMER_TICK');
+    assert(resumedTicks.length >= 1, 'Timer ticks must resume counting down after unpausing from BACK_TO_QUESTION!');
+    console.log('✓ Timer countdown cleanly resumes after unpausing from BACK_TO_QUESTION');
 
     // Reset to LOBBY
     host.ws.send(JSON.stringify({ action: 'RESET_GAME' }));
