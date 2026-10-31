@@ -69,6 +69,9 @@ let gameState = {
   isPaused: false,
   autoFlow: true, // Auto progression enabled by default
   questionStartTime: null,
+  totalPausedDuration: 0,
+  pausedAt: null,
+  lastRevealStats: null,
   answers: {} // playerId -> { answer: 'Aumre' | 'Joudy', timestamp: number, pointsEarned: number }
 };
 
@@ -111,6 +114,9 @@ function launchQuestion(qIndex) {
   gameState.questionIndex = qIndex;
   gameState.answers = {};
   gameState.questionStartTime = Date.now();
+  gameState.totalPausedDuration = 0;
+  gameState.pausedAt = null;
+  gameState.isPaused = false;
 
   broadcastGameState();
 
@@ -123,6 +129,7 @@ function launchQuestion(qIndex) {
 function launchReveal() {
   stopTimer();
   gameState.status = 'REVEAL';
+  gameState.pausedAt = null;
 
   const currentQ = QUESTIONS[gameState.questionIndex];
   const correct = currentQ.correctAnswer;
@@ -140,7 +147,7 @@ function launchReveal() {
   const aumrePct = totalVotes > 0 ? Math.round((aumreVotes / totalVotes) * 100) : 50;
   const joudyPct = totalVotes > 0 ? (100 - aumrePct) : 50;
 
-  broadcastReveal({
+  const revealStats = {
     questionIndex: gameState.questionIndex,
     correctAnswer: correct,
     aumreVotes,
@@ -148,7 +155,10 @@ function launchReveal() {
     aumrePct,
     joudyPct,
     totalVotes
-  });
+  };
+  gameState.lastRevealStats = revealStats;
+
+  broadcastReveal(revealStats);
 
   // 8s reveal timer -> auto transitions to LEADERBOARD
   startPhaseTimer(REVEAL_TIMER_SECONDS, () => {
@@ -254,17 +264,18 @@ function broadcastTimerTick() {
     isPaused: gameState.isPaused
   });
   hostSockets.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
-  });
-  players.forEach(p => {
-    if (p.ws && p.ws.readyState === WebSocket.OPEN) p.ws.send(payload);
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(payload); } catch (e) {}
+    }
   });
 }
 
 function broadcastGameState() {
   const hostPayload = JSON.stringify(getHostStatePayload());
   hostSockets.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(hostPayload);
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(hostPayload); } catch (e) {}
+    }
   });
 
   const currentQ = QUESTIONS[gameState.questionIndex];
@@ -272,23 +283,29 @@ function broadcastGameState() {
 
   players.forEach(p => {
     if (p.ws && p.ws.readyState === WebSocket.OPEN) {
-      const myAnswer = gameState.answers[p.id] ? gameState.answers[p.id].answer : null;
+      const answerRecord = gameState.answers[p.id];
+      const myAnswer = answerRecord ? answerRecord.answer : null;
+      const pointsEarned = answerRecord ? answerRecord.pointsEarned : 0;
       const myRank = leaderboard.rankings.findIndex(item => item.id === p.id) + 1;
 
-      p.ws.send(JSON.stringify({
-        type: 'PLAYER_STATE_UPDATE',
-        status: gameState.status,
-        questionIndex: gameState.questionIndex,
-        totalQuestions: QUESTIONS.length,
-        question: currentQ ? currentQ.question : '',
-        timeRemaining: gameState.timeRemaining,
-        maxTime: gameState.maxTime,
-        isPaused: gameState.isPaused,
-        score: p.score,
-        myAnswer,
-        rank: myRank || 1,
-        totalPlayers: leaderboard.totalPlayers
-      }));
+      try {
+        p.ws.send(JSON.stringify({
+          type: 'PLAYER_STATE_UPDATE',
+          status: gameState.status,
+          questionIndex: gameState.questionIndex,
+          totalQuestions: QUESTIONS.length,
+          question: currentQ ? currentQ.question : '',
+          timeRemaining: gameState.timeRemaining,
+          maxTime: gameState.maxTime,
+          isPaused: gameState.isPaused,
+          score: p.score,
+          myAnswer,
+          pointsEarned,
+          rank: myRank || 1,
+          totalPlayers: leaderboard.totalPlayers,
+          lastRevealStats: gameState.lastRevealStats || null
+        }));
+      } catch (e) {}
     }
   });
 }
@@ -300,7 +317,9 @@ function broadcastReveal(stats) {
     status: 'REVEAL'
   });
   hostSockets.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(hostPayload);
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(hostPayload); } catch (e) {}
+    }
   });
 
   const leaderboard = getLeaderboard(players.size);
@@ -313,19 +332,21 @@ function broadcastReveal(stats) {
       const pointsEarned = answerRecord ? answerRecord.pointsEarned : 0;
       const myRank = leaderboard.rankings.findIndex(item => item.id === p.id) + 1;
 
-      p.ws.send(JSON.stringify({
-        type: 'REVEAL_RESULT',
-        questionIndex: gameState.questionIndex,
-        correctAnswer: stats.correctAnswer,
-        myAnswer,
-        isCorrect,
-        pointsEarned,
-        newScore: p.score,
-        rank: myRank,
-        totalPlayers: leaderboard.totalPlayers,
-        aumrePct: stats.aumrePct,
-        joudyPct: stats.joudyPct
-      }));
+      try {
+        p.ws.send(JSON.stringify({
+          type: 'REVEAL_RESULT',
+          questionIndex: gameState.questionIndex,
+          correctAnswer: stats.correctAnswer,
+          myAnswer,
+          isCorrect,
+          pointsEarned,
+          newScore: p.score,
+          rank: myRank,
+          totalPlayers: leaderboard.totalPlayers,
+          aumrePct: stats.aumrePct,
+          joudyPct: stats.joudyPct
+        }));
+      } catch (e) {}
     }
   });
 }
@@ -354,6 +375,9 @@ const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws) => {
   ws.isAlive = true;
+  ws.on('error', (err) => {
+    console.error('WS client error:', err && err.message);
+  });
   ws.on('pong', () => { ws.isAlive = true; });
 
   let clientType = 'UNKNOWN';
@@ -388,6 +412,9 @@ wss.on('connection', (ws) => {
 
         if (pId && players.has(pId)) {
           const existing = players.get(pId);
+          if (existing.ws && existing.ws !== ws) {
+            try { existing.ws.terminate(); } catch (e) {}
+          }
           existing.ws = ws;
           existing.connected = true;
           existing.nickname = nickname || existing.nickname;
@@ -422,6 +449,9 @@ wss.on('connection', (ws) => {
         const pId = msg.playerId;
         if (pId && players.has(pId)) {
           const p = players.get(pId);
+          if (p.ws && p.ws !== ws) {
+            try { p.ws.terminate(); } catch (e) {}
+          }
           p.ws = ws;
           p.connected = true;
           attachedPlayerId = pId;
@@ -443,6 +473,7 @@ wss.on('connection', (ws) => {
 
       if (msg.type === 'SUBMIT_ANSWER' && attachedPlayerId) {
         if (gameState.status !== 'QUESTION') return;
+        if (gameState.isPaused) return; // Reject votes while paused
         if (gameState.answers[attachedPlayerId]) return;
 
         const chosen = msg.answer;
@@ -453,7 +484,9 @@ wss.on('connection', (ws) => {
 
         let points = 0;
         if (isCorrect) {
-          const elapsedSec = (Date.now() - (gameState.questionStartTime || Date.now())) / 1000;
+          const pausedTime = gameState.totalPausedDuration || 0;
+          const effectiveElapsedMs = Math.max(0, (Date.now() - (gameState.questionStartTime || Date.now())) - pausedTime);
+          const elapsedSec = effectiveElapsedMs / 1000;
           const speedFactor = Math.max(0, 1 - (elapsedSec / QUESTION_TIMER_SECONDS));
           points = Math.round(500 + (500 * speedFactor));
         }
@@ -476,13 +509,20 @@ wss.on('connection', (ws) => {
         // Send updated state to host
         const hostPayload = JSON.stringify(getHostStatePayload());
         hostSockets.forEach(h => {
-          if (h.readyState === WebSocket.OPEN) h.send(hostPayload);
+          if (h.readyState === WebSocket.OPEN) {
+            try { h.send(hostPayload); } catch (e) {}
+          }
         });
 
-        // If all online players answered early during QUESTION, auto-reveal!
+        // Quorum-based auto-reveal: only if all registered answered, or >= 75% registered answered AND all connected answered
+        const totalReg = players.size;
         const activeCount = Array.from(players.values()).filter(pl => pl.connected).length;
         const ansCount = Object.keys(gameState.answers).length;
-        if (activeCount > 0 && ansCount >= activeCount && gameState.autoFlow && !gameState.isPaused) {
+
+        const allRegisteredAnswered = totalReg > 0 && ansCount >= totalReg;
+        const quorumMet = totalReg > 0 && (ansCount / totalReg >= 0.75) && (ansCount >= activeCount);
+
+        if ((allRegisteredAnswered || quorumMet) && gameState.autoFlow && !gameState.isPaused) {
           launchReveal();
         }
       }
@@ -497,12 +537,17 @@ wss.on('connection', (ws) => {
       hostSockets.delete(ws);
     } else if (attachedPlayerId && players.has(attachedPlayerId)) {
       const p = players.get(attachedPlayerId);
-      p.connected = false;
-      p.ws = null;
-      const hostPayload = JSON.stringify(getHostStatePayload());
-      hostSockets.forEach(h => {
-        if (h.readyState === WebSocket.OPEN) h.send(hostPayload);
-      });
+      // Only null out if this closing socket is the player's active socket
+      if (p.ws === ws) {
+        p.connected = false;
+        p.ws = null;
+        const hostPayload = JSON.stringify(getHostStatePayload());
+        hostSockets.forEach(h => {
+          if (h.readyState === WebSocket.OPEN) {
+            try { h.send(hostPayload); } catch (e) {}
+          }
+        });
+      }
     }
   });
 });
@@ -521,8 +566,11 @@ function handleHostAction(msg) {
       break;
 
     case 'BACK_TO_QUESTION':
-      // Return to question view without re-running full timer
+      // Return to question view, stop timer, and pause
+      stopTimer();
       gameState.status = 'QUESTION';
+      gameState.isPaused = true;
+      gameState.pausedAt = Date.now();
       broadcastGameState();
       break;
 
@@ -531,7 +579,10 @@ function handleHostAction(msg) {
       break;
 
     case 'NEXT_QUESTION':
-      if (gameState.questionIndex + 1 < QUESTIONS.length) {
+      if (gameState.status === 'LOBBY') {
+        gameState.isPaused = false;
+        launchQuestion(0);
+      } else if (gameState.questionIndex + 1 < QUESTIONS.length) {
         launchQuestion(gameState.questionIndex + 1);
       } else {
         launchFinal();
@@ -545,11 +596,22 @@ function handleHostAction(msg) {
       break;
 
     case 'TOGGLE_PAUSE':
-      gameState.isPaused = !gameState.isPaused;
+      if (!gameState.isPaused) {
+        gameState.isPaused = true;
+        gameState.pausedAt = Date.now();
+      } else {
+        gameState.isPaused = false;
+        if (gameState.pausedAt) {
+          gameState.totalPausedDuration = (gameState.totalPausedDuration || 0) + (Date.now() - gameState.pausedAt);
+          gameState.pausedAt = null;
+        }
+      }
       broadcastTimerTick();
       const hostPayload = JSON.stringify(getHostStatePayload());
       hostSockets.forEach(h => {
-        if (h.readyState === WebSocket.OPEN) h.send(hostPayload);
+        if (h.readyState === WebSocket.OPEN) {
+          try { h.send(hostPayload); } catch (e) {}
+        }
       });
       break;
 
@@ -559,6 +621,9 @@ function handleHostAction(msg) {
       gameState.questionIndex = 0;
       gameState.answers = {};
       gameState.isPaused = false;
+      gameState.totalPausedDuration = 0;
+      gameState.pausedAt = null;
+      gameState.lastRevealStats = null;
       players.forEach(p => { p.score = 0; });
       broadcastGameState();
       break;
@@ -1418,12 +1483,23 @@ const HOST_HTML = `<!DOCTYPE html>
     let audioCtx = null;
     let currentHostState = null;
     let guestListCache = [];
+    let lastRenderedStatus = null;
+    let lastRenderedQuestionIndex = null;
 
     const urlParams = new URLSearchParams(window.location.search);
     let currentPin = urlParams.get('pin') || localStorage.getItem('wedding_host_pin') || '';
 
+    function unlockAudio() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    }
+    window.addEventListener('click', unlockAudio, { once: true });
+    window.addEventListener('keydown', unlockAudio, { once: true });
+    window.addEventListener('touchstart', unlockAudio, { once: true });
+
     function initAudio() {
       if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
     }
 
     function playTone(freq, duration = 0.1, type = 'sine') {
@@ -1563,6 +1639,9 @@ const HOST_HTML = `<!DOCTYPE html>
     }
 
     function renderHostState(data) {
+      const statusChanged = data.status !== lastRenderedStatus;
+      const questionChanged = data.questionIndex !== lastRenderedQuestionIndex;
+
       document.getElementById('headerPlayerCount').textContent = data.totalActivePlayers + ' Guests Online';
       document.getElementById('lobbyCount').textContent = data.totalRegisteredPlayers;
       guestListCache = data.guestList || [];
@@ -1591,15 +1670,18 @@ const HOST_HTML = `<!DOCTYPE html>
         switchView('viewQuestion');
         document.getElementById('questionBadge').textContent = 'Question ' + (data.questionIndex + 1) + ' of ' + data.totalQuestions;
         document.getElementById('questionText').textContent = data.currentQuestion ? data.currentQuestion.question : '';
-        const ratio = data.answeredCount + ' / ' + data.totalActivePlayers + ' Answered';
+        const totalReg = data.totalRegisteredPlayers || data.totalActivePlayers || 1;
+        const ratio = data.answeredCount + ' / ' + totalReg + ' Answered (' + data.totalActivePlayers + ' Online)';
         document.getElementById('answeredRatio').textContent = ratio;
-        const pct = data.totalActivePlayers > 0 ? (data.answeredCount / data.totalActivePlayers) * 100 : 0;
+        const pct = totalReg > 0 ? (data.answeredCount / totalReg) * 100 : 0;
         document.getElementById('answeredProgressFill').style.width = Math.min(100, pct) + '%';
       }
 
       if (data.status === 'REVEAL') {
         switchView('viewReveal');
-        playReveal();
+        if (statusChanged || questionChanged) {
+          playReveal();
+        }
         const correct = data.currentQuestion.correctAnswer;
         document.getElementById('revealTitle').textContent = "Official Answer: " + correct;
 
@@ -1633,8 +1715,10 @@ const HOST_HTML = `<!DOCTYPE html>
 
       if (data.status === 'FINAL') {
         switchView('viewFinal');
-        if (typeof confetti === 'function') confetti({ particleCount: 150, spread: 80 });
-        playFanfare();
+        if (statusChanged) {
+          if (typeof confetti === 'function') confetti({ particleCount: 150, spread: 80 });
+          playFanfare();
+        }
         const top = data.leaderboard;
         if (top[0]) {
           document.getElementById('podium1Name').textContent = top[0].nickname;
@@ -1649,6 +1733,9 @@ const HOST_HTML = `<!DOCTYPE html>
           document.getElementById('podium3Score').textContent = top[2].score.toLocaleString() + ' pts';
         }
       }
+
+      lastRenderedStatus = data.status;
+      lastRenderedQuestionIndex = data.questionIndex;
     }
 
     function renderGuestDrawerList() {
@@ -1700,16 +1787,51 @@ const HOST_HTML = `<!DOCTYPE html>
       });
     }
 
-    // Spacebar toggles Pause / Resume or advances cleanly
+    function advanceStage() {
+      if (!currentHostState) return;
+      const s = currentHostState.status;
+      if (s === 'LOBBY') {
+        hostAction('START_GAME');
+      } else if (s === 'QUESTION') {
+        hostAction('REVEAL_NOW');
+      } else if (s === 'REVEAL') {
+        hostAction('SHOW_LEADERBOARD');
+      } else if (s === 'LEADERBOARD') {
+        hostAction('NEXT_QUESTION');
+      }
+    }
+
+    // Keyboard & Presenter Clicker Remote:
+    // Spacebar / ArrowRight / PageDown: Advance game stages
+    // ArrowLeft / PageUp: Previous question
+    // 'P': Pause / Resume
+    // 'F': Fullscreen
     window.addEventListener('keydown', (e) => {
-      if (e.target.tagName === 'INPUT') return;
-      if (e.code === 'Space') {
+      if (e.target && e.target.tagName === 'INPUT') return;
+      if (e.code === 'Space' || e.code === 'ArrowRight' || e.code === 'PageDown') {
+        e.preventDefault();
+        advanceStage();
+      } else if (e.code === 'ArrowLeft' || e.code === 'PageUp') {
+        e.preventDefault();
+        hostAction('PREV_QUESTION');
+      } else if (e.code === 'KeyP') {
         e.preventDefault();
         hostAction('TOGGLE_PAUSE');
       } else if (e.code === 'KeyF') {
+        e.preventDefault();
         toggleFullscreen();
       }
     });
+
+    const pinInput = document.getElementById('pinInput');
+    if (pinInput) {
+      pinInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          submitHostPin();
+        }
+      });
+    }
 
     connectWS();
   </script>
@@ -1750,10 +1872,16 @@ const PLAYER_HTML = `<!DOCTYPE html>
       color: var(--pine);
       font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
       min-height: 100vh;
+      min-height: 100dvh;
       min-height: -webkit-fill-available;
       display: flex;
       flex-direction: column;
       user-select: none;
+      -webkit-user-select: none;
+      padding-top: env(safe-area-inset-top, 0px);
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+      padding-left: env(safe-area-inset-left, 0px);
+      padding-right: env(safe-area-inset-right, 0px);
     }
 
     #reconnectBanner {
@@ -1936,6 +2064,9 @@ const PLAYER_HTML = `<!DOCTYPE html>
       justify-content: center;
       cursor: pointer;
       touch-action: manipulation;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
       transition: transform 0.1s ease, opacity 0.2s, box-shadow 0.2s;
       position: relative;
     }
@@ -2174,6 +2305,26 @@ const PLAYER_HTML = `<!DOCTYPE html>
       };
     }
 
+    function checkAndReconnect() {
+      if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        connectWS();
+      } else if (ws.readyState === WebSocket.OPEN && playerId) {
+        ws.send(JSON.stringify({ type: 'PLAYER_REJOIN', playerId, nickname }));
+      }
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        checkAndReconnect();
+      }
+    });
+
+    window.addEventListener('pageshow', () => {
+      checkAndReconnect();
+    });
+
+    document.addEventListener('touchstart', () => {}, { passive: true });
+
     function joinGame() {
       const input = document.getElementById('nicknameInput');
       const name = input.value.trim();
@@ -2297,6 +2448,33 @@ const PLAYER_HTML = `<!DOCTYPE html>
             btnJ.classList.remove('is-selected', 'is-dimmed');
             banner.style.display = 'none';
           }
+        } else if (msg.status === 'REVEAL' || msg.status === 'LEADERBOARD') {
+          if (msg.myAnswer && msg.lastRevealStats) {
+            switchScreen('screenResult');
+            const icon = document.getElementById('resIcon');
+            const title = document.getElementById('resTitle');
+            const pts = document.getElementById('resPoints');
+            const offAns = document.getElementById('resOfficialAnswerText');
+
+            const isCorrect = msg.myAnswer === msg.lastRevealStats.correctAnswer;
+            if (isCorrect) {
+              icon.textContent = '🎉';
+              title.textContent = 'Splendid!';
+              title.style.color = '#182f28';
+              pts.textContent = '+' + (msg.pointsEarned || 0).toLocaleString() + ' pts';
+            } else {
+              icon.textContent = '😅';
+              title.textContent = 'Not quite!';
+              title.style.color = '#7d2a3e';
+              pts.textContent = '+0 pts';
+            }
+
+            offAns.textContent = 'Official Answer: ' + msg.lastRevealStats.correctAnswer;
+            document.getElementById('resTotalScore').textContent = (msg.score || 0).toLocaleString() + ' pts';
+            document.getElementById('resRank').textContent = '#' + (msg.rank || 1) + ' of ' + (msg.totalPlayers || 1);
+          } else {
+            switchScreen('screenLobby');
+          }
         } else if (msg.status === 'FINAL') {
           switchScreen('screenFinal');
           document.getElementById('finalScore').textContent = (msg.score || 0).toLocaleString() + ' pts';
@@ -2306,8 +2484,17 @@ const PLAYER_HTML = `<!DOCTYPE html>
     }
 
     window.addEventListener('DOMContentLoaded', () => {
-      if (nickname && !playerId) {
-        document.getElementById('nicknameInput').value = nickname;
+      const nameInput = document.getElementById('nicknameInput');
+      if (nameInput) {
+        if (nickname && !playerId) {
+          nameInput.value = nickname;
+        }
+        nameInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            joinGame();
+          }
+        });
       }
       connectWS();
     });

@@ -4,7 +4,8 @@
   "description": "Multiplayer Wedding Quiz for Aumre & Joudy",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test-suite.js"
   },
   "dependencies": {
     "express": "^4.21.2",
